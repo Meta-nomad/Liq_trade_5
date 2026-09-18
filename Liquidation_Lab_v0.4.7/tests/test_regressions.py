@@ -174,3 +174,17 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
             service.last_engine_error = ''
             service.last_engine_tick = time.time() - 60
             self.assertEqual((await api.health()).status_code, 503)
+
+    async def test_excluded_symbols_do_not_keep_stale_warmup_diagnostics(self):
+        from app.strategy import StrategyRouter
+        router = StrategyRouter(self.settings)
+        features = {symbol: FeatureSnapshot(symbol, 1000, 100, 1, True)
+                    for symbol in ('BTC_USDT', 'ETH_USDT')}
+        states = {symbol: self.market.symbol(symbol) for symbol in features}
+        router.evaluate_all(states, features, 1000)
+        self.assertEqual(set(router.diagnostics()), set(features))
+        router.evaluate_all({'BTC_USDT': states['BTC_USDT']},
+                            {'BTC_USDT': features['BTC_USDT']}, 1030)
+        self.assertEqual(set(router.diagnostics()), {'BTC_USDT'})
+        router.evaluate_all({}, {}, 1060)
+        self.assertEqual(router.diagnostics(), {})

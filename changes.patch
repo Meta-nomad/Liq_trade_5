@@ -682,7 +682,17 @@
          if item.liquidation_events_300s < self.settings.liquidation_min_events:
              diagnostic["reversal_blocker"] = "liquidation_too_few_events"
              return None
-@@ -887,7 +859,7 @@
+@@ -870,6 +842,9 @@
+         now: float | None = None,
+     ) -> list[Signal]:
+         current_time = now or time.time()
++        # Eligibility may shrink between ticks; never retain excluded symbols'
++        # old warmup counters or decisions in the current diagnostic snapshot.
++        self.composite.last_diagnostics = {}
+         if self._started_at is None:
+             self._started_at = current_time
+         raw = RegimeDetector.detect(features)
+@@ -887,7 +862,7 @@
              # Readiness is evaluated over the active, eligible pool passed by
              # the service.  A few symbols with delayed/partial history must
              # not freeze trading for all symbols that are already live.
@@ -691,7 +701,7 @@
              and ready_ratio >= self.settings.min_ready_ratio
              and warmup_elapsed >= self.settings.startup_warmup_seconds
              and regime_elapsed >= self.settings.regime_confirm_seconds
-@@ -909,6 +881,7 @@
+@@ -909,6 +884,7 @@
                          f"startup={warmup_elapsed:.0f}/{self.settings.startup_warmup_seconds}s",
                          f"regime={regime_elapsed:.0f}/{self.settings.regime_confirm_seconds}s",
                          f"ready={ready_ratio:.0%}",
@@ -729,7 +739,7 @@
                  continue
 --- a/AUDIT_RU.md
 +++ b/AUDIT_RU.md
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,130 @@
 +# Разбор Liquidation Lab 0.4.6 и исправления 0.4.7
 +
 +Дата: 18 сентября 2026. Исходный архив SHA-256: `dbf7eba1d77d44d80ecb94c9fe10d468f8ede26052069da01d6e5a499634b1d6`.
@@ -765,13 +775,14 @@
 +
 +## Проверки
 +
-+Исходный набор: 15 тестов, все проходили ещё до исправлений. После изменений: 30
-+тестов, все прошли. Добавлены 15 регрессий: отсутствие метаданных, разрешение API и
++Исходный набор: 15 тестов, все проходили ещё до исправлений. После изменений: 31
++тестов, все прошли. Добавлены 16 регрессий: отсутствие метаданных, разрешение API и
 +история, неполный REST-ответ, контрактные единицы/региональное плечо, разделение
 +funding бирж, отсутствие proxy-сигналов, отказ SQLite, атомарность и перезапуск,
 +synthetic startup/shutdown, ошибка checkpoint и HTTP health. Дополнительно проверены
 +полный путь liquidation LONG/SHORT, глубина выхода в единицах позиции, некорректный
-+стакан и объяснение отказа по плечу. Подробный разбор логики: STRATEGY_REVIEW_RU.md.
++стакан и объяснение отказа по плечу. Проверено удаление устаревших диагностик после сокращения Universe.
++Подробный разбор логики: STRATEGY_REVIEW_RU.md.
 +
 +Среда: Windows, Python 3.14.7, зависимости установлены из requirements.txt.
 +Полная команда: `python -m pytest tests scenario_model` из корня проекта.
@@ -815,7 +826,7 @@
 +5. **Честная оценка стратегии.** Разделять liquidation и breakout, long и short,
 +   режимы рынка, комиссии, пропуски данных и отклонённые входы. Score — эвристика,
 +   не вероятность. Нужны expectancy после затрат, drawdown, интервалы неопределённости,
-+   out-of-sample и сравнение с простой базовой стратегией. 30 тестов этого не доказывают.
++   out-of-sample и сравнение с простой базовой стратегией. 31 тест этого не доказывают.
 +6. **Операционная защита.** Проверить backup/restore, отказ диска, потерю REST/WS,
 +   перезапуск во время позиции, мониторинг возраста данных и ошибочные настройки.
 +   Панель с токеном; секреты будущего исполнителя не хранить в публичной панели.
@@ -887,7 +898,7 @@
  
 -# Liquidation Lab 0.4.3 — эксперимент, 15 сентября 2026
 +Бумажная торговля на публичных данных. Реальных заявок и клиента с ключами нет.
-+Проверен локальный запуск, 30 автоматических тестов и 35 секунд публичных потоков
++Проверен локальный запуск, 31 автоматический тестов и 35 секунд публичных потоков
 +BTC на MEXC / Bybit / Binance. Длительная работа 115 символов и Railway не проверены.
  
 -Готовый код бумажного эксперимента, НЕ проверенная прибыльная стратегия.
@@ -1012,7 +1023,7 @@
  
 -# Liquidation Lab 0.4.6 — эксперимент, 18 сентября 2026
 +Бумажная торговля на публичных данных. Реальных заявок и клиента с ключами нет.
-+Проверен локальный запуск, 30 автоматических тестов и 35 секунд публичных потоков
++Проверен локальный запуск, 31 автоматический тестов и 35 секунд публичных потоков
 +BTC на MEXC / Bybit / Binance. Длительная работа 115 символов и Railway не проверены.
  
 -Готовый код бумажного эксперимента, НЕ проверенная прибыльная стратегия.
@@ -1427,7 +1438,7 @@
 +        self.assertLess(decision['liquidation_distance_pct'],decision['required_stop_buffer_pct'])
 --- a/tests/test_regressions.py
 +++ b/tests/test_regressions.py
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,190 @@
 +import asyncio
 +import json
 +import sqlite3
@@ -1604,6 +1615,20 @@
 +            service.last_engine_error = ''
 +            service.last_engine_tick = time.time() - 60
 +            self.assertEqual((await api.health()).status_code, 503)
++
++    async def test_excluded_symbols_do_not_keep_stale_warmup_diagnostics(self):
++        from app.strategy import StrategyRouter
++        router = StrategyRouter(self.settings)
++        features = {symbol: FeatureSnapshot(symbol, 1000, 100, 1, True)
++                    for symbol in ('BTC_USDT', 'ETH_USDT')}
++        states = {symbol: self.market.symbol(symbol) for symbol in features}
++        router.evaluate_all(states, features, 1000)
++        self.assertEqual(set(router.diagnostics()), set(features))
++        router.evaluate_all({'BTC_USDT': states['BTC_USDT']},
++                            {'BTC_USDT': features['BTC_USDT']}, 1030)
++        self.assertEqual(set(router.diagnostics()), {'BTC_USDT'})
++        router.evaluate_all({}, {}, 1060)
++        self.assertEqual(router.diagnostics(), {})
 --- a/tests/test_v040_unittest.py
 +++ b/tests/test_v040_unittest.py
 @@ -25,11 +25,11 @@

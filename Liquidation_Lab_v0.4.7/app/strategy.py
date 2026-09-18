@@ -842,6 +842,9 @@ class StrategyRouter:
         now: float | None = None,
     ) -> list[Signal]:
         current_time = now or time.time()
+        # Eligibility may shrink between ticks; never retain excluded symbols'
+        # old warmup counters or decisions in the current diagnostic snapshot.
+        self.composite.last_diagnostics = {}
         if self._started_at is None:
             self._started_at = current_time
         raw = RegimeDetector.detect(features)
