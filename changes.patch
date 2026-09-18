@@ -1,0 +1,1622 @@
+--- a/app/__init__.py
++++ b/app/__init__.py
+@@ -4,4 +4,4 @@
+ code path capable of sending a real order.
+ """
+ 
+-__version__ = "0.4.6"
++__version__ = "0.4.7"
+--- a/app/api.py
++++ b/app/api.py
+@@ -7,6 +7,7 @@
+ 
+ from fastapi import Depends, FastAPI, Header, HTTPException, Query
+ from fastapi.responses import HTMLResponse
++from fastapi.responses import JSONResponse
+ 
+ from . import __version__
+ from .config import Settings
+@@ -35,7 +36,7 @@
+ 
+ app = FastAPI(
+     title="Order Flow Paper Lab",
+-    version="0.4.6",
++    version="0.4.7",
+     lifespan=lifespan,
+     docs_url="/docs",
+     redoc_url=None,
+@@ -54,14 +55,14 @@
+ async def health() -> dict[str, object]:
+     lag = time.time() - service.last_engine_tick if service.last_engine_tick else None
+     healthy = bool(service.last_engine_tick and lag is not None and lag < 30 and not service.last_engine_error)
+-    return {
++    return JSONResponse(status_code=200 if healthy else 503, content={
+         "version": __version__,
+         "status": "ok" if healthy else "starting",
+         "paper_only": True,
+         "live_trading_enabled": False,
+         "engine_lag_seconds": lag,
+         "error": service.last_engine_error,
+-    }
++    })
+ 
+ 
+ @app.get("/api/status", dependencies=[Depends(authorise)])
+@@ -115,6 +116,7 @@
+ <div id="runtime" class="muted">Подключение к рыночным потокам…</div>
+ <div id="accounts" class="grid"></div>
+ <section class="section"><h2>Потоки данных</h2><div id="feeds" class="feeds"></div></section>
++<section class="section"><h2>Почему нет входа</h2><pre id="decisions" style="white-space:pre-wrap" class="card"></pre></section>
+ <section class="section"><h2>Открытые позиции</h2><div class="tablewrap"><table><thead><tr><th>Счёт</th><th>Пара</th><th>Сторона</th><th>Сетап</th><th>Вход</th><th>Mark</th><th>PnL</th><th>R</th></tr></thead><tbody id="positions"></tbody></table></div></section>
+ <section class="section"><h2>Последние закрытые сделки</h2><div class="tablewrap"><table><thead><tr><th>Время</th><th>Счёт</th><th>Пара</th><th>Сторона</th><th>Причина</th><th>PnL</th><th>ROI маржи</th><th>Плечо</th><th>R</th></tr></thead><tbody id="trades"></tbody></table></div></section>
+ </main><script>
+@@ -125,6 +127,17 @@
+ document.getElementById('runtime').textContent=`Движок: ${s.universe_error?'торговля заблокирована — проверка монет: '+s.universe_error:(s.last_engine_error?'ошибка: '+s.last_engine_error:'работает')} · задержка ${n(s.engine_lag_seconds,1)} с · uptime ${n(s.uptime_seconds/60,1)} мин`;
+ document.getElementById('accounts').innerHTML=Object.values(s.accounts).map(a=>`<div class="card account"><h2>${a.name}</h2><div class="metric"><span class="muted">Equity</span><span class="value">${n(a.equity)} USDT</span></div><div class="metric"><span class="muted">Доходность</span><span class="value ${cls(a.return_pct)}">${n(a.return_pct)}%</span></div><div class="metric"><span class="muted">Просадка</span><span class="value ${cls(a.drawdown_pct)}">${n(a.drawdown_pct)}%</span></div><div class="metric"><span class="muted">W / L</span><span class="value">${a.wins} / ${a.losses}</span></div><div class="metric"><span class="muted">Комиссии</span><span class="value">${n(a.total_fees)} USDT</span></div><div class="metric"><span class="muted">Статус</span><span class="value">${a.halted_reason||'активен'}</span></div></div>`).join('');
+ document.getElementById('feeds').innerHTML=Object.values(s.market.feeds).map(f=>`<div class="feed"><span class="dot ${f.connected?'on':''}"></span>${f.name}: ${f.connected?'online':'offline'} · ${f.messages}</div>`).join('');
++
++const labels={liquidation_too_few_events:'мало событий ликвидации',liquidation_volume_too_small:'недостаточный объём ликвидаций',liquidation_opposes_regime:'разворот против трендового фильтра',reversal_flow_or_liquidation:'разворот потока/стакана не подтверждён',reversal_score_below_threshold:'слабое подтверждение сигнала',reversal_interval:'ожидание следующей проверки',data_not_ready:'данные ещё не готовы',stop_outside_liquidation_buffer:'стоп не помещается перед ликвидацией',contract_leverage_limit:'плечо выше лимита контракта',metadata_unverified:'метаданные не проверены',api_not_allowed:'API контракта не разрешён',execution_depth_spread:'не хватает глубины или слишком дорогой вход',position_already_open:'позиция уже открыта',one_position_per_lab_account:'счёт уже занят',cooldown:'пауза после входа',opened:'вход выполнен'};
++const explain=x=>labels[x]||x;
++const diag=Object.values(s.diagnostics?.symbols||{});
++const decisions=(s.diagnostics?.entry_decisions||[]).sort((a,b)=>b.ts-a.ts).slice(0,12);
++document.getElementById('decisions').textContent=[
++ `Допущено монет: ${s.universe_eligible_count} · режим: ${s.diagnostics?.market_regime||'—'}`,
++ ...diag.slice(0,20).map(d=>`${d.symbol}: ${(d.blockers||[]).map(explain).join('; ')||d.state}`),
++ ...decisions.map(d=>`${new Date(d.ts*1000).toLocaleTimeString()} · ${d.symbol} · ${d.leverage}×: ${explain(d.reason)}`)
++].join('\n');
++
+ const pos=[];Object.values(s.accounts).forEach(a=>a.positions.forEach(p=>pos.push({...p,account:a.name})));document.getElementById('positions').innerHTML=pos.length?pos.map(p=>`<tr><td>${p.account}</td><td>${p.symbol}</td><td>${p.side}</td><td>${p.setup}</td><td>${n(p.entry_price,5)}</td><td>${n(p.mark_price,5)}</td><td class="${cls(p.unrealized_pnl)}">${n(p.unrealized_pnl)}</td><td>${n(p.current_r)}</td></tr>`).join(''):'<tr><td colspan="8" class="muted">Пока нет открытых позиций</td></tr>';
+ document.getElementById('trades').innerHTML=t.length?t.slice(0,50).map(x=>`<tr><td>${new Date(x.closed_at*1000).toLocaleString()}</td><td>${x.account}</td><td>${x.symbol}</td><td>${x.side}</td><td>${x.reason}</td><td class="${cls(x.net_pnl)}">${n(x.net_pnl)}</td><td>${n(x.net_roi_pct)}%</td><td>${n(x.leverage,0)}×</td><td>${n(x.r_multiple)}</td></tr>`).join(''):'<tr><td colspan="9" class="muted">Закрытых сделок пока нет</td></tr>';
+ }catch(e){document.getElementById('runtime').textContent='Dashboard API недоступен: '+e;console.error(e)}}load();setInterval(load,10000);
+--- a/app/feeds/bybit.py
++++ b/app/feeds/bybit.py
+@@ -141,12 +141,7 @@
+             state.update_derivatives(
+                 ts=ts,
+                 open_interest=float(cached["openInterest"]) if cached.get("openInterest") else None,
+-                funding_rate=float(cached["fundingRate"]) if cached.get("fundingRate") else None,
+-                next_funding_at=(
+-                    float(cached["nextFundingTime"]) / 1000.0
+-                    if cached.get("nextFundingTime")
+-                    else None
+-                ),
++
+             )
+         elif topic.startswith("allLiquidation."):
+             rows = payload.get("data") or []
+--- a/app/feeds/mexc.py
++++ b/app/feeds/mexc.py
+@@ -4,6 +4,7 @@
+ import gzip
+ import json
+ import logging
++import math
+ import time
+ from contextlib import suppress
+ from typing import Any
+@@ -29,9 +30,12 @@
+         self.settings = settings
+         self._stop = asyncio.Event()
+         self._http: httpx.AsyncClient | None = None
++        self._request_lock = asyncio.Lock()
++        self._last_request_at = 0.0
+ 
+     async def bootstrap(self) -> None:
+-        self._http = httpx.AsyncClient(timeout=15.0, headers={"Language": "en-US"})
++        if self._http is None:
++            self._http = httpx.AsyncClient(timeout=15.0, headers={"Language": "en-US"})
+         # MEXC throttles the public contract/kline endpoints aggressively.
+         # Keep bootstrap deliberately gentle so a larger candidate pool does
+         # not turn into a burst of "Requests are too frequent" responses.
+@@ -42,7 +46,8 @@
+                 for attempt in range(3):
+                     try:
+                         await self._load_contract(symbol)
+-                        await self._load_klines(symbol)
++                        if len(self.market.symbol(symbol).hour_closes) < 200:
++                            await self._load_klines(symbol)
+                         await self._load_funding(symbol)
+                         return
+                     except Exception as exc:  # feed retries live even if bootstrap is partial
+@@ -56,6 +61,11 @@
+     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+         if self._http is None:
+             self._http = httpx.AsyncClient(timeout=15.0, headers={"Language": "en-US"})
++        async with self._request_lock:
++            wait = 0.25 - (time.monotonic() - self._last_request_at)
++            if wait > 0:
++                await asyncio.sleep(wait)
++            self._last_request_at = time.monotonic()
+         response = await self._http.get(f"{self.rest_url}{path}", params=params)
+         response.raise_for_status()
+         payload = response.json()
+@@ -64,28 +74,38 @@
+         return payload.get("data")
+ 
+     async def _load_contract(self, symbol: str) -> None:
++        state = self.market.symbol(symbol)
++        state.contract_metadata_ready = False
++        state.api_allowed = False
+         data = await self._get("/api/v1/contract/detail/country", {"symbol": symbol})
+         if isinstance(data, list):
+             data = next((item for item in data if item.get("symbol") == symbol), {})
+-        if not isinstance(data, dict):
+-            return
+-        state = self.market.symbol(symbol)
+-        state.contract_size = float(data.get("contractSize") or 1.0)
+-        state.maintenance_margin_rate = float(data.get("maintenanceMarginRate") or 0.005)
+-        # Some public MEXC responses omit apiAllowed entirely. Missing is not
+-        # an explicit denial; contract metadata and paper-broker checks remain
+-        # the binding safeguards. Only an explicit false blocks fallback.
+-        state.api_allowed = data.get("apiAllowed", True) is not False
+-        # maxLeverage is omitted by some regional/public responses.  Keep a
+-        # conservative paper-simulation default instead of making every
+-        # otherwise live symbol permanently ineligible.
+-        state.contract_max_leverage = float(data.get("maxLeverage") or 200.0)
+-        # MEXC has changed optional metadata fields across public endpoints.
+-        # Symbol identity and max leverage are the minimum reliable fields;
+-        # contract size/MMR retain conservative defaults when omitted.
+-        state.contract_metadata_ready = bool(
+-            (data.get("symbol") in {None, symbol}) and state.contract_max_leverage > 0
+-        )
++        if not isinstance(data, dict) or data.get("symbol") != symbol:
++            raise ValueError(f"Missing contract metadata: {symbol}")
++        size = float(data["contractSize"])
++        mmr = float(data["maintenanceMarginRate"])
++        leverage = float(data["maxLeverage"])
++        regional = float(data.get("countryConfigContractMaxLeverage") or 0)
++        if regional > 0:
++            leverage = min(leverage, regional)
++        if not all(math.isfinite(v) for v in (size, mmr, leverage, regional)):
++            raise ValueError("Non-finite contract metadata")
++        if size <= 0 or not 0 < mmr < 1 or leverage < 1:
++            raise ValueError("Invalid contract limits")
++        if (data.get("state") != 0 or data.get("quoteCoin") != "USDT"
++                or data.get("settleCoin") != "USDT" or data.get("futureType") != 1
++                or data.get("preMarket", False)):
++            raise ValueError("Inactive or unsupported contract")
++        if state.contract_size != size:
++            # Books/trades received before metadata used unknown contract units.
++            book = state.book("mexc")
++            book.bids.clear(); book.asks.clear(); book.updated_at = 0
++            state.trades["mexc"].clear()
++        state.contract_size = size
++        state.maintenance_margin_rate = mmr
++        state.contract_max_leverage = leverage
++        state.api_allowed = data.get("apiAllowed") is True
++        state.contract_metadata_ready = True
+ 
+     async def _load_klines(self, symbol: str) -> None:
+         now = int(time.time())
+@@ -239,6 +259,9 @@
+         state = self.market.symbol(symbol)
+         ts = float(payload.get("ts") or time.time() * 1000) / 1000.0
+ 
++        if not state.contract_metadata_ready and channel in {"push.deal", "push.depth", "push.depth.full"}:
++            return
++
+         if channel == "push.deal":
+             rows = payload.get("data", [])
+             if isinstance(rows, dict):
+@@ -261,7 +284,7 @@
+         # MEXC returns full-depth subscriptions as push.depth.full (some
+         # deployments use the shorter push.depth name). Treat both forms as
+         # order-book snapshots so the execution/universe gates see a BBO.
+-        elif channel in {"push.depth", "push.depth.full"}:
++        elif channel == "push.depth.full":
+             data = payload.get("data") or {}
+             version = int(data["version"]) if data.get("version") is not None else None
+             state.book("mexc").apply_snapshot(
+--- a/app/orderbook.py
++++ b/app/orderbook.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import time
++import math
+ from dataclasses import dataclass, field
+ from typing import Iterable
+ 
+@@ -62,7 +63,7 @@
+                 continue
+             price = float(values[0])
+             qty = float(values[1]) * qty_multiplier
+-            if price > 0 and qty > 0:
++            if math.isfinite(price) and math.isfinite(qty) and price > 0 and qty > 0:
+                 result[price] = qty
+         return result
+ 
+@@ -78,6 +79,8 @@
+                 continue
+             price = float(values[0])
+             qty = float(values[1]) * qty_multiplier
++            if not math.isfinite(price) or not math.isfinite(qty):
++                continue
+             if qty <= 0:
+                 target.pop(price, None)
+             elif price > 0:
+@@ -92,7 +95,8 @@
+     def best_bid_ask(self) -> tuple[float, float] | None:
+         if not self.bids or not self.asks:
+             return None
+-        return max(self.bids), min(self.asks)
++        bid, ask = max(self.bids), min(self.asks)
++        return (bid, ask) if 0 < bid < ask else None
+ 
+     def mid(self) -> float | None:
+         bbo = self.best_bid_ask()
+@@ -154,5 +158,22 @@
+         return max(0.0, raw)
+ 
+     def is_fresh(self, now: float, stale_after: float) -> bool:
+-        return bool(self.updated_at and now - self.updated_at <= stale_after)
++        return bool(self.updated_at and 0 <= now - self.updated_at <= stale_after)
+ 
++    def quantity_impact_bps(self, side: Side, quantity: float) -> float:
++        """Walk a fixed base quantity, as required when closing a position."""
++        levels = self.top_asks(50) if side == Side.LONG else self.top_bids(50)
++        if quantity <= 0 or not levels:
++            return float('inf')
++        remaining, value = quantity, 0.0
++        for price, available in levels:
++            taken = min(remaining, available)
++            value += taken * price
++            remaining -= taken
++            if remaining <= quantity * 1e-12:
++                break
++        if remaining > quantity * 1e-12:
++            return float('inf')
++        reference = levels[0][0]
++        return max(0.0, float(side) * (value / quantity / reference - 1) * 10000)
++
+--- a/app/paper.py
++++ b/app/paper.py
+@@ -33,6 +33,7 @@
+         settings: Settings,
+         configs: Iterable[AccountConfig],
+     ) -> None:
++        self.entry_decisions: dict[str, dict[str, Any]] = {}
+         self.market = market
+         self.settings = settings
+         now = time.time()
+@@ -109,6 +110,7 @@
+         *,
+         now: float | None = None,
+         stress: float = 1.0,
++        base_qty: float | None = None,
+     ) -> Fill | None:
+         state = self.market.symbol(symbol)
+         current_time = now or time.time()
+@@ -120,7 +122,8 @@
+         if bid >= ask:
+             return None
+         reference = ask if execution_side == Side.LONG else bid
+-        impact = book.impact_bps(execution_side, notional)
++        impact = (book.quantity_impact_bps(execution_side, base_qty)
++                  if base_qty is not None else book.impact_bps(execution_side, notional))
+         if not math.isfinite(impact):
+             return None
+         slippage = max(self.settings.min_slippage_bps, impact) * stress
+@@ -145,28 +148,42 @@
+             risk_pct *= 0.5
+         return risk_pct
+ 
++    def _entry_decision(self, account, signal, now, reason, **details):
++        self.entry_decisions[f"{account.name}:{signal.symbol}"] = {
++            "account": account.name, "symbol": signal.symbol, "ts": now,
++            "setup": signal.setup, "side": signal.side.label,
++            "score": signal.score, "stop_pct": signal.stop_pct,
++            "leverage": account.max_leverage, "reason": reason, **details,
++        }
++        return False
++
+     def can_open(self, account: AccountState, signal: Signal, now: float) -> bool:
++        def reject(reason):
++            return self._entry_decision(account, signal, now, reason)
++        if signal.symbol not in self.market.symbols:
++            return reject("unknown_symbol")
++        if not all(math.isfinite(v) for v in (signal.score, signal.stop_pct, signal.risk_pct, signal.ts)):
++            return reject("invalid_signal_numbers")
++        if not 0 < signal.stop_pct < 1 or signal.risk_pct < 0:
++            return reject("invalid_signal_risk")
+         self._roll_risk_periods(account, now)
+         if self.settings.data_mode == "live" and self.market.symbol(signal.symbol).universe_valid_until < now:
+-            return False
++            return reject("universe_not_verified")
+         if account.halted_reason:
+-            return False
++            return reject(account.halted_reason)
+         if signal.symbol in account.positions:
+-            return False
++            return reject("position_already_open")
+         if len(account.positions) >= self.settings.max_open_positions:
+-            return False
++            return reject("position_limit")
+         if self.settings.high_leverage_lab and account.positions:
+-            return False  # one position per independent experiment account
++            return reject("one_position_per_lab_account")
+         cluster = self._correlation_cluster(signal.symbol)
+-        if any(
+-            self._correlation_cluster(symbol) == cluster
+-            for symbol in account.positions
+-        ):
+-            return False
++        if any(self._correlation_cluster(symbol) == cluster for symbol in account.positions):
++            return reject("correlation_limit")
+         if account.cooldowns.get(signal.symbol, 0.0) > now:
+-            return False
++            return reject("cooldown")
+         if signal.score < self.settings.signal_threshold:
+-            return False
++            return reject("score_below_threshold")
+         return True
+ 
+     @staticmethod
+@@ -183,28 +200,37 @@
+     def open_from_signal(self, account: AccountState, signal: Signal, now: float) -> Position | None:
+         if self.settings.high_leverage_lab and signal.setup not in {
+             "LIQUIDATION_EXHAUSTION",
+-            "MEXC_FLOW_EXHAUSTION",
+             "SYSTEMATIC_BREAKOUT_4H",
+         }:
++            self._entry_decision(account, signal, now, "setup_not_allowed")
+             return None
+         if not self.can_open(account, signal, now):
+             return None
+         equity = self.equity(account)
+         if equity <= 0:
+             account.halted_reason = "account depleted"
++            self._entry_decision(account, signal, now, "account_depleted")
+             return None
+ 
+         state = self.market.symbol(signal.symbol)
+         if self.settings.high_leverage_lab and self.settings.data_mode == "live":
+             distance = 1.0 / account.max_leverage - state.maintenance_margin_rate - 2*self.settings.taker_fee_rate
+-            if not state.contract_metadata_ready or account.max_leverage > state.contract_max_leverage or signal.stop_pct + 0.002 >= distance:
+-                logging.getLogger(__name__).info("PAPER REJECT account=%s symbol=%s reason=leverage_metadata_or_liquidation_buffer", account.name, signal.symbol)
++            if not state.contract_metadata_ready or not state.api_allowed or account.max_leverage > state.contract_max_leverage or signal.stop_pct + 0.002 >= distance:
++                reason = ("metadata_unverified" if not state.contract_metadata_ready else
++                          "api_not_allowed" if not state.api_allowed else
++                          "contract_leverage_limit" if account.max_leverage > state.contract_max_leverage else
++                          "stop_outside_liquidation_buffer")
++                self._entry_decision(account, signal, now, reason,
++                    liquidation_distance_pct=distance*100,
++                    required_stop_buffer_pct=(signal.stop_pct+.002)*100)
++                logging.getLogger(__name__).info("PAPER REJECT account=%s symbol=%s reason=%s", account.name, signal.symbol, reason)
+                 return None
+         risk_pct = self._effective_risk_pct(account, signal)
+         risk_budget = equity * risk_pct / 100.0
+         open_risk = sum(position.initial_risk_usdt for position in account.positions.values())
+         max_open_risk = equity * self.settings.max_portfolio_risk_pct / 100.0
+         if open_risk + risk_budget > max_open_risk:
++            self._entry_decision(account, signal, now, "portfolio_risk_limit")
+             return None
+         estimated_cost_pct = 2.0 * self.settings.taker_fee_rate + (
+             2.0 * self.settings.min_slippage_bps / 10_000.0
+@@ -218,9 +244,11 @@
+         )
+         notional = min(desired_notional, available_margin * account.max_leverage)
+         if notional < 10.0:
++            self._entry_decision(account, signal, now, "notional_below_minimum")
+             return None
+         fill = self._fill(signal.symbol, signal.side, notional, now=now)
+         if fill is None or fill.slippage_bps > self.settings.impact_slippage_bps or state.book("mexc").spread_bps() > self.settings.max_entry_spread_bps:
++            self._entry_decision(account, signal, now, "execution_depth_spread")
+             logging.getLogger(__name__).info("PAPER REJECT account=%s symbol=%s reason=execution_depth_spread", account.name, signal.symbol)
+             return None
+         # Re-size using observed entry impact and stress allowance for exit.
+@@ -268,6 +296,8 @@
+             max_holding_minutes=signal.max_holding_minutes,
+         )
+         logging.getLogger(__name__).info("PAPER POSITION account=%s leverage=%.0f margin=%.4f notional=%.4f risk=%.4f target_net_roi=250%% liquidation_model=APPROXIMATE", account.name, position.leverage, position.margin, position.notional, position.initial_risk_usdt)
++        self._entry_decision(account, signal, now, "opened", position_id=position.id,
++                             notional=notional, planned_risk=actual_risk)
+         account.positions[signal.symbol] = position
+         account.cooldowns[signal.symbol] = now + self.settings.cooldown_seconds
+         return position
+@@ -296,7 +326,7 @@
+         exit_side = Side.SHORT if position.side == Side.LONG else Side.LONG
+         exit_reference = self.market.symbol(position.symbol).book("mexc").best_bid_ask()
+         exit_value = position.qty * (exit_reference[0] if position.side == Side.LONG else exit_reference[1]) if exit_reference else position.notional
+-        fill = self._fill(position.symbol, exit_side, exit_value, now=now, stress=stress)
++        fill = self._fill(position.symbol, exit_side, exit_value, now=now, stress=stress, base_qty=position.qty)
+         if fill is None:
+             logging.getLogger(__name__).warning("PAPER EXIT UNRESOLVED account=%s symbol=%s reason=missing_execution_liquidity", account.name, position.symbol)
+             return None
+@@ -355,7 +385,8 @@
+             self._roll_risk_periods(account, current_time)
+             for symbol, position in list(account.positions.items()):
+                 state = self.market.symbol(symbol)
+-                bbo = state.fresh_reference_bbo(current_time, self.settings.stale_after_seconds)
++                book = state.book("mexc")
++                bbo = book.best_bid_ask() if book.is_fresh(current_time, self.settings.stale_after_seconds) else None
+                 if not bbo:
+                     continue
+                 bid, ask = bbo
+@@ -383,7 +414,7 @@
+                 stop_hit = mark <= position.stop_price if position.side == Side.LONG else mark >= position.stop_price
+                 target_hit = mark >= position.target_price if position.side == Side.LONG else mark <= position.target_price
+                 if self.settings.high_leverage_lab:
+-                    exit_fill = self._fill(symbol, Side(-int(position.side)), position.qty*mark, now=current_time)
++                    exit_fill = self._fill(symbol, Side(-int(position.side)), position.qty*mark, now=current_time, base_qty=position.qty)
+                     if exit_fill is None:
+                         target_hit = False
+                     else:
+@@ -441,7 +472,7 @@
+                 stress = 1.0
+                 liquidation_fee = 0.0
+                 if liquidated:
+-                    reason = "LIQUIDATION"
++                    reason = "APPROX_LIQUIDATION"
+                     stress = 3.0
+                     liquidation_fee = 0.0004
+                 elif stop_hit:
+@@ -472,7 +503,7 @@
+             return
+         for account in self.accounts.values():
+             position = account.positions.get(symbol)
+-            if not position or settlement_ts <= position.last_funding_at:
++            if not position or settlement_ts <= max(position.last_funding_at, position.opened_at):
+                 continue
+             cashflow = -position.notional * rate * float(position.side)
+             account.balance += cashflow
+--- a/app/service.py
++++ b/app/service.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import copy
+ import logging
+ import time
+ from contextlib import suppress
+@@ -77,7 +78,7 @@
+             len(self.settings.symbols),
+             self.settings.paper_balance,
+         )
+-        LOGGER.info("RELEASE v0.4.6-20260918 accounts=%s execution=PAPER_ONLY venues=MEXC_EXECUTION,BYBIT_LIQUIDATION,BINANCE_CONFIRMATION liquidation_regime_aligned=true flow_proxy_executable=true",
++        LOGGER.info("RELEASE v0.4.7-20260918 accounts=%s execution=PAPER_ONLY venues=MEXC_EXECUTION,BYBIT_LIQUIDATION,BINANCE_CONFIRMATION liquidation_regime_aligned=true flow_proxy_executable=false",
+                     ",".join(self.broker.accounts))
+ 
+     async def _refresh_universe(self) -> None:
+@@ -116,7 +117,14 @@
+         except Exception as exc:
+             LOGGER.exception("MEXC bootstrap failed: %s", exc)
+             await self.storage.event(time.time(), "ERROR", "MEXC_BOOTSTRAP", str(exc))
++        self.tasks.append(asyncio.create_task(self._refresh_mexc(mexc), name="mexc-refresh"))
+         await asyncio.gather(*runners)
++
++    async def _refresh_mexc(self, mexc) -> None:
++        while not self._stopping:
++            await asyncio.sleep(300)
++            await mexc.bootstrap()
++            await self.universe_gate.refresh_mexc_only(self.settings.symbols, self.market)
+ 
+     async def _status_log_loop(self) -> None:
+         """Emit a low-volume operational heartbeat for hosting logs."""
+@@ -203,6 +211,12 @@
+     async def _engine_loop(self) -> None:
+         while not self._stopping:
+             tick_started = time.time()
++            before = copy.deepcopy(self.broker.snapshots())
++            committed = False
++            previous_dedup = self._last_signal.copy()
++            previous_decisions = copy.deepcopy(self.broker.entry_decisions)
++            counters = (self.signal_count, self.open_count, self.close_count)
++            funding_times = {symbol: state.next_funding_at for symbol, state in self.market.symbols.items()}
+             try:
+                 features: dict[str, FeatureSnapshot] = {
+                     symbol: state.features(tick_started, self.settings.stale_after_seconds)
+@@ -211,7 +225,6 @@
+                 closed = self.broker.evaluate_positions(features, tick_started)
+                 for trade in closed:
+                     self.close_count += 1
+-                    await self.storage.save_trade(trade)
+                     LOGGER.info(
+                         "PAPER CLOSE account=%s symbol=%s reason=%s pnl=%.2f R=%.2f",
+                         trade.account,
+@@ -221,7 +234,7 @@
+                         trade.r_multiple,
+                     )
+ 
+-                active = self.universe_gate.eligible_symbols or None
++                active = self.universe_gate.eligible_symbols if self.settings.data_mode == "live" else None
+                 signal_states = self.market.symbols if active is None else {
+                     symbol: self.market.symbol(symbol) for symbol in active
+                 }
+@@ -253,17 +266,16 @@
+                         self.broker.apply_funding(symbol, state.funding_rate, settlement)
+                         # Most contracts use an 8-hour cycle; a newer exchange update
+                         # will replace this timestamp as soon as it arrives.
+-                        state.next_funding_at = settlement + 8 * 3_600.0
++                        state.next_funding_at = 0.0  # Wait for the next venue-announced settlement.
++
++                await self.storage.save_checkpoint(tick_started, closed, self.broker.snapshots())
++                committed = True
+ 
+                 if tick_started - self._last_feature_persist >= self.settings.feature_persist_seconds:
+                     for feature in features.values():
+                         await self.storage.save_feature(feature)
+                     self._last_feature_persist = tick_started
+ 
+-                if tick_started - self._last_account_persist >= self.settings.account_persist_seconds:
+-                    await self.storage.save_account_states(tick_started, self.broker.snapshots())
+-                    self._last_account_persist = tick_started
+-
+                 if tick_started - self._last_equity_persist >= 60.0:
+                     await self.storage.save_equity(tick_started, self.broker.status())
+                     self._last_equity_persist = tick_started
+@@ -271,8 +283,18 @@
+                 self.last_engine_tick = tick_started
+                 self.last_engine_error = ""
+             except asyncio.CancelledError:
++                if not committed:
++                    self.broker.restore(before)
++                    self.broker.entry_decisions = previous_decisions
+                 raise
+             except Exception as exc:
++                if not committed:
++                    self.broker.restore(before)
++                    self.broker.entry_decisions = previous_decisions
++                    self._last_signal = previous_dedup
++                    self.signal_count, self.open_count, self.close_count = counters
++                    for symbol, settlement in funding_times.items():
++                        self.market.symbol(symbol).next_funding_at = settlement
+                 self.last_engine_error = str(exc)
+                 LOGGER.exception("Paper engine tick failed")
+                 with suppress(Exception):
+@@ -288,6 +310,10 @@
+             "mode": "PAPER_ONLY",
+             "data_mode": self.settings.data_mode,
+             "live_trading_enabled": False,
++            "execution_model": "APPROXIMATE_PAPER",
++            "eligibility_policy": "MEXC_METADATA_HISTORY_BOOK",
++            "storage_path": str(self.storage.path),
++            "entry_eligible_symbols": sorted(self.universe_gate.eligible_symbols),
+             "started_at": self.started_at,
+             "uptime_seconds": now - self.started_at,
+             "last_engine_tick": self.last_engine_tick,
+@@ -312,6 +338,7 @@
+             "market_breadth": self.router.last_regime.breadth,
+             "market_stress": self.router.last_regime.stress,
+             "symbols": self.router.diagnostics(),
++            "entry_decisions": list(self.broker.entry_decisions.values()),
+         }
+ 
+     async def stop(self) -> None:
+--- a/app/storage.py
++++ b/app/storage.py
+@@ -21,26 +21,11 @@
+ 
+     async def initialise(self) -> None:
+         self.path.parent.mkdir(parents=True, exist_ok=True)
+-        try:
+-            self.connection = sqlite3.connect(self.path, check_same_thread=False)
+-        except sqlite3.OperationalError as exc:
+-            # A Railway volume can briefly be mounted with ownership that does
+-            # not allow SQLite to create its file. Keep paper mode alive so
+-            # health/log diagnostics remain available instead of crash-looping.
+-            fallback = Path("/tmp/paper_v040_fallback.db")
+-            LOGGER.error(
+-                "STORAGE PRIMARY UNAVAILABLE path=%s error=%s; using fallback=%s",
+-                self.path,
+-                exc,
+-                fallback,
+-            )
+-            self.path = fallback
+-            self.path.parent.mkdir(parents=True, exist_ok=True)
+-            self.connection = sqlite3.connect(self.path, check_same_thread=False)
+-            LOGGER.warning("STORAGE NONPERSISTENT FALLBACK active path=%s", self.path)
++        # Never silently replace an existing experiment with a temporary account.
++        self.connection = sqlite3.connect(self.path, check_same_thread=False)
+         self.connection.row_factory = sqlite3.Row
+         self.connection.execute("PRAGMA journal_mode=WAL")
+-        self.connection.execute("PRAGMA synchronous=NORMAL")
++        self.connection.execute("PRAGMA synchronous=FULL")
+         self.connection.executescript(
+             """
+             CREATE TABLE IF NOT EXISTS signals (
+@@ -158,6 +143,28 @@
+             )
+             self._conn().commit()
+ 
++    async def save_checkpoint(self, ts, trades, payloads) -> None:
++        """Commit closed trades and the corresponding balances/positions together."""
++        async with self.lock:
++            with self._conn():
++                for trade in trades:
++                    self._conn().execute(
++                        """INSERT OR REPLACE INTO trades(
++                        id,account,symbol,setup,side,opened_at,closed_at,
++                        net_pnl,r_multiple,reason,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
++                        (trade.id, trade.account, trade.symbol, trade.setup,
++                         trade.side.label, trade.opened_at, trade.closed_at,
++                         trade.net_pnl, trade.r_multiple, trade.reason,
++                         json.dumps(trade.as_dict(), ensure_ascii=False, allow_nan=False)),
++                    )
++                for name, payload in payloads.items():
++                    self._conn().execute(
++                        """INSERT INTO account_states(name,updated_at,payload) VALUES(?,?,?)
++                        ON CONFLICT(name) DO UPDATE SET updated_at=excluded.updated_at,
++                        payload=excluded.payload""",
++                        (name, ts, json.dumps(payload, ensure_ascii=False, allow_nan=False)),
++                    )
++
+     async def save_feature(self, feature: FeatureSnapshot) -> None:
+         async with self.lock:
+             self._conn().execute(
+--- a/app/strategy.py
++++ b/app/strategy.py
+@@ -702,34 +702,6 @@
+             diagnostic["reversal_blocker"] = "reversal_interval"
+             return None
+         self._last_reversal_evaluation[state.symbol] = now
+-        # MEXC-only mode has no public liquidation feed. Use a deliberately
+-        # strict order-flow exhaustion proxy instead of silently producing no
+-        # trades: aggressive one-sided flow, tight book, and enough prints.
+-        if item.liquidation_events_300s == 0:
+-            if item.trade_count_60s < 20 or abs(item.flow_fast) < 0.35 or abs(item.book_imbalance) < 0.12:
+-                diagnostic["reversal_blocker"] = "mexc_flow_proxy_not_confirmed"
+-                return None
+-            side = Side.LONG if item.flow_fast < 0 else Side.SHORT
+-            if regime_side is not None and side != regime_side:
+-                diagnostic["reversal_blocker"] = "flow_opposes_regime"
+-                return None
+-            book_alignment = -float(side) * item.book_imbalance
+-            if book_alignment < 0.12:
+-                diagnostic["reversal_blocker"] = "mexc_book_not_reversing"
+-                return None
+-            score = _clamp(78.0 + abs(item.flow_fast) * 24.0 + abs(item.book_imbalance) * 12.0, 0.0, 96.0)
+-            if score < max(82.0, self.settings.signal_threshold):
+-                diagnostic["reversal_blocker"] = "mexc_proxy_score_below_threshold"
+-                return None
+-            stop_pct = _clamp(max(item.atr_pct * 1.8, 0.006), 0.006, 0.025)
+-            return Signal(
+-                symbol=state.symbol, strategy="composite", setup="MEXC_FLOW_EXHAUSTION",
+-                side=side, score=score, stop_pct=stop_pct, target_r=1.8, ts=now,
+-                risk_pct=self._risk_pct(score, regime),
+-                reasons=[f"stable market regime {regime.name}", "MEXC-only aggressive-flow exhaustion proxy"],
+-                feature_data={**item.as_dict(), "regime": regime.name, "proxy": True},
+-                exit_mode="fixed", max_holding_minutes=180,
+-            )
+         if item.liquidation_events_300s < self.settings.liquidation_min_events:
+             diagnostic["reversal_blocker"] = "liquidation_too_few_events"
+             return None
+@@ -887,7 +859,7 @@
+             # Readiness is evaluated over the active, eligible pool passed by
+             # the service.  A few symbols with delayed/partial history must
+             # not freeze trading for all symbols that are already live.
+-            and ready_count >= 10
++            and ready_count >= min(10, len(features))
+             and ready_ratio >= self.settings.min_ready_ratio
+             and warmup_elapsed >= self.settings.startup_warmup_seconds
+             and regime_elapsed >= self.settings.regime_confirm_seconds
+@@ -909,6 +881,7 @@
+                         f"startup={warmup_elapsed:.0f}/{self.settings.startup_warmup_seconds}s",
+                         f"regime={regime_elapsed:.0f}/{self.settings.regime_confirm_seconds}s",
+                         f"ready={ready_ratio:.0%}",
++                        f"ready_symbols={ready_count}/{min(10, len(features))}",
+                     ],
+                 }
+             return []
+--- a/app/universe.py
++++ b/app/universe.py
+@@ -58,17 +58,14 @@
+         eligible = set()
+         for symbol in symbols:
+             state = market.symbol(symbol)
+-            # Metadata/leverage are enforced again by PaperBroker at entry.
+-            # Universe must not reject an otherwise live contract merely
+-            # because MEXC omits the optional apiAllowed field.
+-            # MEXC's public contract-detail endpoint is intermittently
+-            # unavailable/partial by region.  For paper trading, live
+-            # history + a fresh executable book are the meaningful gates;
+-            # PaperBroker still applies leverage/liquidation safeguards.
+-            if not state.contract_metadata_ready:
+-                state.contract_metadata_ready = True
+-                state.contract_max_leverage = state.contract_max_leverage or 200.0
+-                LOG.warning("MEXC METADATA FALLBACK symbol=%s max_leverage=%.0f", symbol, state.contract_max_leverage)
++            if symbol not in DEFAULT_SYMBOLS:
++                continue
++            if not state.contract_metadata_ready or not state.api_allowed:
++                continue
++            closed_hours = [(ts, price) for ts, price in state.hour_closes
++                            if ts + 3600 <= now and price > 0]
++            if len(closed_hours) < 200:
++                continue
+             bbo = state.book("mexc").best_bid_ask()
+             if not bbo:
+                 continue
+--- a/AUDIT_RU.md
++++ b/AUDIT_RU.md
+@@ -0,0 +1,129 @@
++# Разбор Liquidation Lab 0.4.6 и исправления 0.4.7
++
++Дата: 18 сентября 2026. Исходный архив SHA-256: `dbf7eba1d77d44d80ecb94c9fe10d468f8ede26052069da01d6e5a499634b1d6`.
++
++## Вывод
++
++В 0.4.6 есть работающий каркас исследовательского сервиса, но несколько изменений
++сняли ограничения, которые документация продолжала обещать. Его статистику нельзя
++использовать как доказательство пригодности автоторговли. Исправленная 0.4.7 закрывает
++перечисленные ниже дефекты; это проверенная локально бумажная сборка, не готовый
++автоторговый продукт и не подтверждённая прибыльная стратегия.
++
++## Найденные дефекты и действия
++
++| Приоритет | Место исходного кода | Проблема | Изменение |
++|---|---|---|---|
++| Критический | app/universe.py, _mexc_fallback | Отсутствие метаданных превращалось в metadata_ready=True и плечо 200. Проверки 200 часов и API из комментария не выполнялись. | Убрана мутация, восстановлены обязательные проверки. |
++| Критический | app/feeds/mexc.py, _load_contract | Даже пустой словарь мог получить размер 1, MMR 0.005 и плечо 200. | Обязательные поля, конечные числа, статус и идентичность контракта проверяются. Региональный лимит учитывается. |
++| Высокий | app/strategy.py, _reversal_candidate; app/paper.py | Ноль ликвидаций включал MEXC_FLOW_EXHAUSTION и торговлю в том же эксперименте. | Эта подстановка удалена; брокер тоже отвергает такой setup в лаборатории. |
++| Высокий | app/feeds/bybit.py, tickers | Funding Bybit записывался в общие поля и применялся к позициям MEXC. | Bybit обновляет OI, но не funding исполнения MEXC. |
++| Высокий | app/storage.py, initialise | При отказе SQLite создавалась /tmp-база; восстановление прежних счетов терялось. | Ошибка постоянной базы останавливает запуск. |
++| Высокий | app/service.py, _engine_loop | Запись закрытия и состояния счёта разделялась интервалом до 10 секунд. | Один атомарный checkpoint, rollback памяти при ошибке до commit. |
++| Высокий | app/feeds/mexc.py | WS запускался раньше метаданных, объёмы умножались на неизвестный размер контракта. | Сообщения объёма ожидают метаданные; при смене размера очищаются старые стакан и сделки. |
++| Средний | app/service.py | Пустой Universe через `or None` включал расчёт по всем символам. Брокер отдельно блокировал вход, но сигналы вводили в заблуждение. | Пустой допуск теперь остаётся пустым. |
++| Средний | app/service.py | Следующий funding выдумывался через 8 часов, начальная ошибка bootstrap не повторялась. | Ожидание следующего объявленного settlement; периодический retry метаданных/недостающей истории. |
++| Средний | app/paper.py | Выход мог инициироваться BBO другой биржи при отсутствии свежего MEXC; старое funding могло начислиться новой позиции. | Триггеры выхода по свежему MEXC; отсечка settlement до открытия. |
++| Средний | app/api.py | /health возвращал HTTP 200 даже при ошибке движка. | HTTP 503 при неготовности/ошибке/задержке. |
++| Средний | README, pyproject, START_RU | Версии 0.4.3/0.4.4/0.4.6 и описание другого пути Universe. | Версия и инструкции синхронизированы с кодом. |
++
++Важное различие: актуальный рабочий путь использует MEXC Universe, а не Bybit REST.
++Возраст 180 дней и оборот 10 млн, обещанные прежним README, он не проверяет.
++В 0.4.7 это явно указано. 200 часов истории не доказывают возраст или качество актива.
++
++## Проверки
++
++Исходный набор: 15 тестов, все проходили ещё до исправлений. После изменений: 30
++тестов, все прошли. Добавлены 15 регрессий: отсутствие метаданных, разрешение API и
++история, неполный REST-ответ, контрактные единицы/региональное плечо, разделение
++funding бирж, отсутствие proxy-сигналов, отказ SQLite, атомарность и перезапуск,
++synthetic startup/shutdown, ошибка checkpoint и HTTP health. Дополнительно проверены
++полный путь liquidation LONG/SHORT, глубина выхода в единицах позиции, некорректный
++стакан и объяснение отказа по плечу. Подробный разбор логики: STRATEGY_REVIEW_RU.md.
++
++Среда: Windows, Python 3.14.7, зависимости установлены из requirements.txt.
++Полная команда: `python -m pytest tests scenario_model` из корня проекта.
++
++Публичный smoke test BTC длительностью 35 секунд: MEXC 205 сообщений, Bybit 1307,
++Binance 7475. Получены размер контракта 0.0001 и 320 часовых свечей; BTC допущен
++Universe. Ошибка движка пустая, виртуальных входов 0 (прогрев специально 3600 секунд).
++Это тест соединений и bootstrap, не тест реальной торговой сделки и не длительный
++нагрузочный прогон. Полный результат — live_probe.json. Поле reconnects Binance
++не является надёжным счётчиком отказов: два его канала делят общий FeedStatus.
++
++## Почему некоторые плечи не будут торговать
++
++В коде требуется: stop_pct + 0.002 < 1/L − MMR − 2×fee.
++Минимальный stop_pct=0.006: слева минимум 0.008. При 200x справа ещё до вычета
++расходов не больше 0.005, поэтому такой вход невозможен при положительной MMR.
++При 100x, MMR=0.005 и fee=0.0008 справа 0.0034 — также отказ. Это несовместимость
++параметров эксперимента, а не ошибка отсутствия сигналов. Плечо нужно выбирать
++после расчёта стопа и ограничений контракта, сохраняя риск, а не сужать стоп ради 200x.
++
++## Что ещё нужно до реальной автоторговли
++
++1. **Воспроизводимые данные.** Записывать исходные события с venue, exchange timestamp,
++   receive timestamp, sequence и contract version. Отдельно отмечать разрывы,
++   восстановление snapshot и пропуски. Сохранять конфигурацию и версию стратегии
++   вместе с каждым экспериментом. Нужны replay и проверка на независимом периоде.
++2. **Точная модель исполнения.** Сейчас это оценка по стакану, без округления до
++   volUnit/minVol/priceUnit, частичных исполнений, очереди и задержек. Выход теперь
++   проходит фиксированное количество по уровням стакана, но не моделирует очередь.
++   Risk tiers, mark price и ADL не воспроизводятся; APPROX_LIQUIDATION не результат биржи.
++   Funding всё ещё оценочный: ставка из последнего сообщения и исходный notional,
++   без сверки истории расчётов; пропущенный период может остаться неучтённым.
++3. **Качество истории.** Текущий час участвует в части индикаторов. Нужны единая политика
++   закрытых свечей, обнаружение дыр, восстановление после простоя и обновление истории
++   независимо от её длины. Retry в этой версии не является полной такой системой.
++4. **Устойчивость потоков.** Нужны явная карта инструментов между биржами (включая
++   множители имён), подтверждения подписок, проверка порядка сообщений, resync после
++   переподключения. На 115 символах отдельно проверить лимиты, память и CPU. Текущий
++   SQLite пишет признаки примерно 994 тыс. строк в сутки при 115 символах и 10 секундах;
++   нужны retention, пакетная запись и контроль диска.
++5. **Честная оценка стратегии.** Разделять liquidation и breakout, long и short,
++   режимы рынка, комиссии, пропуски данных и отклонённые входы. Score — эвристика,
++   не вероятность. Нужны expectancy после затрат, drawdown, интервалы неопределённости,
++   out-of-sample и сравнение с простой базовой стратегией. 30 тестов этого не доказывают.
++6. **Операционная защита.** Проверить backup/restore, отказ диска, потерю REST/WS,
++   перезапуск во время позиции, мониторинг возраста данных и ошибочные настройки.
++   Панель с токеном; секреты будущего исполнителя не хранить в публичной панели.
++
++## Архитектура будущего бота
++
++Поток данных → нормализация по бирже → признаки → отдельные стратегии → риск-контроль
++→ намерение заявки → исполнитель → журнал исполнений → сверка с биржей.
++
++**Бот рейтинга/сигналов:** читает текущие read-only API. Показывает время и свежесть
++данных, setup, направление, score и причины отказа. Не объявляет «готов к покупке»
++только потому, что /health зелёный. API-ключи биржи ему не нужны.
++
++**Автоторговый бот:** получает OrderIntent с уникальным client_order_id, символом,
++стороной, размером в контрактах, лимитами цены/проскальзывания, стопом, режимом
++маржи, плечом, сроком действия и версиями данных/стратегии. Paper и Live исполнители
++реализуют один интерфейс, но ведут разные счета и разные журналы.
++
++Жизненный цикл: CREATED → VALIDATED → SUBMITTED → ACKNOWLEDGED → PARTIALLY_FILLED
++→ FILLED / CANCELLED / REJECTED. Timeout после отправки означает UNKNOWN:
++сначала запросить заявку по идентификатору, не отправлять дубль. При старте
++обязательна сверка открытых заявок, фактических позиций и баланса. Биржевой
++защитный стоп выставляется после подтверждённого исполнения; если защита не
++установлена, политика должна явно определить немедленное сокращение/закрытие.
++
++Контроль риска — до каждой заявки и независимо от генератора сигналов:
++доступность контракта, размер/шаг, свежесть цены, допустимое плечо по tier,
++лимит риска сделки и портфеля, доступная маржа, дневной stop и ручной kill switch.
++Повтор входа после неизвестного результата запрещён до reconciliation.
++
++Этапы приёмки: детерминированный replay → непрерывный paper с проверкой отказов
++→ shadow-сверка намерений с биржевыми ограничениями → отдельная проверка live-адаптера.
++Переход к реальным заявкам этой сборкой не реализован. Нельзя просто заменить
++PaperBroker вызовом REST: текущая модель синхронного полного fill для этого не подходит.
++
++## Источники форматов
++
++- MEXC, поля контрактов: https://www.mexc.com/api-docs/futures/market-endpoints/get-contract-info
++- MEXC, публичные рыночные endpoints: https://www.mexc.com/api-docs/futures/market-endpoints
++- Bybit, snapshot/delta: https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook
++
++Исходный архив сохранён без изменений. Архив 0.4.7 содержит код, тесты, этот отчёт
++и результат сетевой проверки; отдельный changes.patch позволяет просмотреть изменения.
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@
+ 
+ [project]
+ name = "orderflow-paper-lab"
+-version = "0.4.3"
++version = "0.4.7"
+ description = "Paper-only crypto futures strategy laboratory"
+ requires-python = ">=3.11"
+ dependencies = [
+--- a/README.md
++++ b/README.md
+@@ -1,65 +1,61 @@
+-ИСПРАВЛЕНИЕ 0.4.3: исправлен запуск с Railway Volume и SQLite.
+-Процесс остаётся root, чтобы смонтированный `/data` был доступен SQLite.
+-Проверка UNIVERSE перенесена в фоновую задачу.
+-При 403 Bybit панель и журнал продолжают работать, новые входы ЗАБЛОКИРОВАНЫ.
+-Повтор проверки через 15 минут, после успешной проверки — раз в час.
+-Фильтры не отключены. Адрес API не подменяется, отказ доступа не обходится.
+-До первой успешной проверки все монеты заблокированы. На странице видна причина.
+-Это исправление перезапусков, а НЕ устранение отказа доступа Bybit.
+-Лог не доказывает причину 403; доступность надо уточнять у Bybit/Railway.
+-Версия кода 0.4.3; имена счетов и база v040 сохранены.
++# Liquidation Lab 0.4.7 — исправленная исследовательская сборка
+ 
+-# Liquidation Lab 0.4.3 — эксперимент, 15 сентября 2026
++Бумажная торговля на публичных данных. Реальных заявок и клиента с ключами нет.
++Проверен локальный запуск, 30 автоматических тестов и 35 секунд публичных потоков
++BTC на MEXC / Bybit / Binance. Длительная работа 115 символов и Railway не проверены.
+ 
+-Готовый код бумажного эксперимента, НЕ проверенная прибыльная стратегия.
+-Реальных заявок и авторизованного биржевого клиента нет.
++## Запуск
+ 
+-## Изменения
+-- Четыре независимых счёта по 1000 USDT: 20x, 50x, 100x, 200x. Их прибыль нельзя складывать как результат одного счёта.
+-- Только LIQUIDATION_EXHAUSTION; сигналы трендового модуля не исполняются в HIGH_LEVERAGE_LAB.
+-- Цель выхода: чистый PnL / НАЧАЛЬНАЯ маржа >= 250%. Это не ROI всего счёта и может отличаться от процента в интерфейсе биржи.
+-- Плановый риск одной сделки максимум 0.25% equity (около 2.50 USDT на счёте 1000). Стоп по волатильности 0.6–2.5%; его не сужаем ради плеча. Плановый риск не гарантирует максимальный убыток при гэпе.
+-- Одна позиция на независимый счёт. Нет усреднения, мартингейла или авто-добавления маржи.
+-- Остаются временной выход, перенос стопа после 1R и защитные остановки. Сделка может закрыться раньше +250%.
+-- Вход требует метаданных MEXC и допустимого maxLeverage. Приближённая дистанция ликвидации = 1/L - MMR - 2*taker_fee; стоп должен быть ещё минимум на 0.2% цены ближе входа. Многие 100x/200x сигналы будут отклонены.
+-- 30 кандидатов вместо 10: BTC ETH SOL XRP BNB DOGE ADA AVAX LINK LTC DOT ATOM NEAR UNI AAVE TRX XLM ETC BCH FIL ICP APT ARB OP SUI INJ RUNE SEI TON HBAR.
+-- Это список кандидатов, НЕ удостоверение надёжности проектов. Новые символы вне списка не принимаются.
+-- Перед стартом Bybit-проверка: активный USDT LinearPerpetual, возраст >=180 дней, нет prelisting/объявленного delisting, оборот >=10 млн USDT/сутки, спред <=10 б.п. Пагинация учитывается. МEXC проверяется отдельно перед входом; нет данных — нет входа.
+-- Список перепроверяется ежечасно; не прошедшие монеты блокируются для новых входов. При сбое обновления новые входы блокируются, открытые позиции продолжают сопровождаться.
+-- Ликвидации: >=5 событий и >=max(50000 USDT, 0.5% оборота Bybit за 5 минут), затем прежние проверки перекоса/потока/стакана. Это начальные гипотезы порогов, не оптимизированные величины.
+-- Проверка разворота каждые 15 секунд вместо 60, окно ликвидаций осталось 5 минут. Глобальные режимы RANGE/STRESS сохранены.
+-- Цена исполнения и глубина теперь берутся из MEXC. Проскальзывание не обрезается сверху; слишком дорогой вход или недостаточная глубина отклоняются. Невозможный выход даёт PAPER EXIT UNRESOLVED, позиция остаётся открытой — такой период нельзя считать достоверным тестом исполнения.
+-- В SQLite и /api/trades добавлены leverage, initial_margin, net_roi_pct. PAPER ACCOUNT показывает каждый счёт отдельно. Краткий PAPER STATUS equity — только первый счёт (20x), не общий капитал.
++Python 3.11+. Из корня проекта:
+ 
+-## Важно про достоверность
+-Это ещё НЕ точный симулятор биржевой ликвидации: используется приближённая формула и котировка, а не полноценный MEXC mark-price/risk-tier/ADL механизм. MMR загружается при bootstrap; её изменение и ступени риска полностью не воспроизводятся. На высоких плечах это существенная погрешность.
+-Funding применяется существующим движком; его предположение о следующем 8-часовом интервале требует отдельной проверки для каждого контракта. Биржевые ограничения количества и шага цены не полностью воспроизводятся.
+-При недоступном стакане выход может остаться неисполненным; наблюдаемый риск не ограничен плановым стопом. Возраст/оборот/спред НЕ проверяют мошенничество или токеномику.
+-Исторические логи шести сделок не содержат пути цен и ликвидаций: пересчитать достоверный результат на 50–200x из них нельзя. Старые 83.3% побед к новой версии не относятся.
++```sh
++python -m venv .venv
++# Windows: .venv\Scripts\activate
++# Linux/macOS: source .venv/bin/activate
++python -m pip install -r requirements.txt
++python -m app
++```
+ 
+-## Запуск: параметры уже в коде
+-1. Загрузить содержимое архива в корень НОВОГО GitHub-репозитория.
+-2. Подключить репозиторий к новому сервису Railway. Dockerfile и railway.toml задают сборку, запуск и проверку /health.
+-3. Для сохранения счёта и журнала при пересоздании контейнера подключить Volume к /data. Путь базы /data/paper_v040.db уже задан в Dockerfile. Без Volume база работает, но может быть потеряна при пересоздании контейнера.
+-В новом сервисе заполнять Variables НЕ требуется. Не нужно копировать .env.example в .env.
+-Встроены: DATA_MODE=live, HIGH_LEVERAGE_LAB=true, PAPER_BALANCE=1000, 30 кандидатов, MAX_ENTRY_SPREAD_BPS=10, LIQUIDATION_MIN_NOTIONAL=50000, LIQUIDATION_MIN_EVENTS=5, LIQUIDATION_MIN_VOLUME_RATIO=0.005, REVERSAL_INTERVAL_SECONDS=15.
+-DASHBOARD_TOKEN необязателен; без него страница и API статистики доступны всем, кто имеет адрес. Защиту можно включить своей переменной позже. Биржевые ключи не нужны.
+-Если сервис уже существовал, его переменные всё ещё имеют приоритет над встроенными значениями; это не проблема для нового пустого сервиса.
+-Версия на странице и в логах: v0.4.3. Четыре PAPER ACCOUNT: LIQ_ROI250_*X_V040. Имена счетов и файл базы сохранены от v0.4.0 для совместимости, это не старая версия кода.
+-Фильтр UNIVERSE запускается при старте. Не прошедшие отбор монеты пропускаются. При недоступности публичного REST блокируются новые сделки, панель продолжает работать. Подробные ограничения симулятора приведены выше.
++Панель: http://localhost:8000. По умолчанию DATA_MODE=live означает реальные
++публичные данные, а исполнение всегда виртуальное. Для проверки без интернета
++задайте DATA_MODE=synthetic. Для первоначального наблюдения задайте SYMBOLS=BTC_USDT.
++Параметры можно задать переменными окружения или файлом .env.
+ 
+-## Проверки
+-python tests/test_v040_unittest.py
+-8 тестов ядра прошли: лимиты ликвидации, неизвестные метаданные, глубина, net-target long/short, отсутствие преждевременного тейка, одна позиция, отбор монет, фильтры числа/объёма ликвидаций.
+-В этой среде отсутствуют dotenv/httpx/fastapi/pytest; установка зависимостей прервана сетевым тайм-аутом. Тесты ядра используют заглушку ТОЛЬКО загрузчика .env; сетевые вызовы не проверялись. compileall прошёл. Полный сервис и реальный приём расширенного потока не проверены. Следующий обязательный этап — бумажный запуск и наблюдение логов.
++Тесты: `python -m pip install pytest`, затем `python -m pytest tests scenario_model`.
+ 
+-## Отдельная математическая модель
+-python scenario_model/model.py --out scenario_results.json
+-Сравнивает 20/50/100/200x при стопе -50% маржи, цели +250%, риске 0.5% счёта. Эти параметры отличаются от основного бота с волатильностным стопом и риском 0.25%.
+-Допущения: комиссия 0.08% и проскальзывание 0.01% за сторону, funding=0 базово; MMR=0.4% условно. Это сценарии, НЕ актуальная тарифная рекомендация и НЕ исторический бэктест. Stress: проскальзывание 0.1% за сторону, funding 0.01% номинала.
+-Replay одной выбранной сделки: python scenario_model/model.py --ticks market.csv --entry 100 --leverage 50 --side LONG. CSV ts,mark,bid,ask,funding_fraction: Unix seconds по возрастанию, первая строка соответствует входу; funding_fraction — отдельный платёж/исходный номинал (плюс = расход). Пропуски тиков могут скрыть стоп/ликвидацию. Сам replay не создаёт сигналы. Ликвидации отмечаются APPROX_LIQUIDATION без выдуманного PnL.
++## Что изменено
+ 
+-Источники форматов и определения PnL:
+-https://bybit-exchange.github.io/docs/v5/market/instrument
+-https://bybit-exchange.github.io/docs/v5/market/tickers
+-https://www.bybit.com/en/help-center/article/Profit-Loss-calculations-USDT-Contract
++- Нет выдуманных метаданных, размера контракта, MMR и разрешения API.
++- Universe требует проверенные MEXC-метаданные, apiAllowed=true, минимум 200
++  завершённых часовых свечей и свежий узкий стакан. Это локальный фильтр;
++  проверок возраста 180 дней и оборота 10 млн в рабочем MEXC-пути нет.
++- При отсутствии ликвидаций обычный поток сделок не заменяет liquidation-сигнал.
++- Bybit поставляет сделки, стакан, OI и ликвидации. Его funding не применяется к MEXC.
++- Исчезла подстановка следующего funding через условные 8 часов.
++- Ошибка основной SQLite завершает запуск; временная база больше не подменяет счёт.
++- Закрытые сделки и состояния счетов фиксируются одной транзакцией каждого тика.
++  При ошибке до фиксации изменения счёта откатываются в памяти.
++- Проверка метаданных и повтор загрузки недостающей истории выполняются раз в 5 минут.
++- /health возвращает HTTP 503, если движок не запустился, отстал или сообщил ошибку.
++  Исправность движка не равна допуску к торговле: смотрите /api/status и /api/diagnostics.
++
++## Ограничения и подключение бота
++
++Смотрите AUDIT_RU.md: это обязательное описание границ достоверности, а не
++утверждение готовности к реальным деньгам. Funding и ликвидация всё ещё приближённые;
++не реализованы полноценные risk tiers, mark-price settlement, округление заявок,
++reconciliation с биржей и восстановление пропущенных рыночных событий.
++
++Четыре независимых счёта по 1000 USDT: 20/50/100/200x. Цель 250% относится к
++начальной марже позиции, а не ко всему счёту. При текущем стопе 200x закономерно
++блокируется. Настройки комиссии — предположение симуляции, не тариф вашего аккаунта.
++
++Бот сигналов может читать /api/status, /api/diagnostics, /api/signals и /api/trades.
++Используйте заголовок X-Dashboard-Token и задайте DASHBOARD_TOKEN; без токена панель
++публична. Числовой score не является вероятностью успеха или прогнозом доходности.
++Превращение сигнала в реальную заявку требует отдельного execution-контура из отчёта.
++
++Для Railway сохранён Dockerfile: подключите постоянный Volume /data. Перед обновлением
++сделайте резервную копию SQLite. Схема БД и названия счетов совместимы, но статистику
++0.4.6 и 0.4.7 нельзя смешивать: правила допуска и состав сигналов изменились.
++Для чистого эксперимента задайте новый DB_PATH, например /data/paper_v047.db.
+--- a/README_RU.md
++++ b/README_RU.md
+@@ -1,73 +1,61 @@
+-ИСПРАВЛЕНИЕ 0.4.6: исправлен запуск с Railway Volume и SQLite, добавлен
+-контролируемый fallback проверки Universe через MEXC.
+-Процесс остаётся root, чтобы смонтированный `/data` был доступен SQLite.
+-Проверка UNIVERSE перенесена в фоновую задачу.
+-При 403 Bybit панель и журнал продолжают работать. После MEXC bootstrap
+-включается только строгий fallback: метаданные контракта, API разрешён,
+-200 часовых закрытий и свежий спред MEXC не шире 10 б.п. Если эти условия
+-не выполнены, новые входы ЗАБЛОКИРОВАНЫ.
+-Повтор проверки через 15 минут, после успешной проверки — раз в час.
+-Фильтры не отключены. Адрес API не подменяется, отказ доступа не обходится.
+-До первой успешной проверки все монеты заблокированы. На странице видна причина.
+-Это исправление перезапусков, а НЕ устранение отказа доступа Bybit.
+-Лог не доказывает причину 403; доступность надо уточнять у Bybit/Railway.
+-Версия кода 0.4.4; имена счетов и база v040 сохранены.
++# Liquidation Lab 0.4.7 — исправленная исследовательская сборка
+ 
+-# Liquidation Lab 0.4.6 — эксперимент, 18 сентября 2026
++Бумажная торговля на публичных данных. Реальных заявок и клиента с ключами нет.
++Проверен локальный запуск, 30 автоматических тестов и 35 секунд публичных потоков
++BTC на MEXC / Bybit / Binance. Длительная работа 115 символов и Railway не проверены.
+ 
+-Готовый код бумажного эксперимента, НЕ проверенная прибыльная стратегия.
+-Реальных заявок и авторизованного биржевого клиента нет.
++## Запуск
+ 
+-## Изменения
+-- Четыре независимых счёта по 1000 USDT: 20x, 50x, 100x, 200x. Их прибыль нельзя складывать как результат одного счёта.
+-- В HIGH_LEVERAGE_LAB исполняются LIQUIDATION_EXHAUSTION и подтверждённый
+-  SYSTEMATIC_BREAKOUT_4H; liquidation-сигнал обязан совпадать с направлением режима.
+-- Цель выхода: чистый PnL / НАЧАЛЬНАЯ маржа >= 250%. Это не ROI всего счёта и может отличаться от процента в интерфейсе биржи.
+-- Плановый риск одной сделки максимум 0.25% equity (около 2.50 USDT на счёте 1000). Стоп по волатильности 0.6–2.5%; его не сужаем ради плеча. Плановый риск не гарантирует максимальный убыток при гэпе.
+-- Одна позиция на независимый счёт. Нет усреднения, мартингейла или авто-добавления маржи.
+-- Остаются временной выход, перенос стопа после 1R и защитные остановки. Сделка может закрыться раньше +250%.
+-- Вход требует метаданных MEXC и допустимого maxLeverage. Приближённая дистанция ликвидации = 1/L - MMR - 2*taker_fee; стоп должен быть ещё минимум на 0.2% цены ближе входа. Многие 100x/200x сигналы будут отклонены.
+-- 115 заранее отобранных кандидатов вместо 30. Это пул для проверки, а не обещание, что каждый символ доступен на MEXC/Bybit.
+-- Это список кандидатов, НЕ удостоверение надёжности проектов. Новые символы вне списка не принимаются.
+-- Перед стартом Bybit-проверка: активный USDT LinearPerpetual, возраст >=180 дней, нет prelisting/объявленного delisting, оборот >=10 млн USDT/сутки, спред <=10 б.п. Пагинация учитывается. Если публичный REST Bybit отвечает 403, применяется только описанный выше MEXC fallback; это не обход блокировки и не отключение фильтров.
+-- Список перепроверяется ежечасно; не прошедшие монеты блокируются для новых входов. При сбое обновления новые входы блокируются, открытые позиции продолжают сопровождаться.
+-- Ликвидации: >=5 событий и >=max(50000 USDT, 0.5% оборота Bybit за 5 минут), затем прежние проверки перекоса/потока/стакана. Это начальные гипотезы порогов, не оптимизированные величины.
+-- Проверка разворота каждые 15 секунд вместо 60, окно ликвидаций осталось 5 минут. Глобальные режимы RANGE/STRESS сохранены.
+-- Цена исполнения и глубина теперь берутся из MEXC. Проскальзывание не обрезается сверху; слишком дорогой вход или недостаточная глубина отклоняются. Невозможный выход даёт PAPER EXIT UNRESOLVED, позиция остаётся открытой — такой период нельзя считать достоверным тестом исполнения.
+-- В SQLite и /api/trades добавлены leverage, initial_margin, net_roi_pct. PAPER ACCOUNT показывает каждый счёт отдельно. Краткий PAPER STATUS equity — только первый счёт (20x), не общий капитал.
++Python 3.11+. Из корня проекта:
+ 
+-## Важно про достоверность
+-Это ещё НЕ точный симулятор биржевой ликвидации: используется приближённая формула и котировка, а не полноценный MEXC mark-price/risk-tier/ADL механизм. MMR загружается при bootstrap; её изменение и ступени риска полностью не воспроизводятся. На высоких плечах это существенная погрешность.
+-Funding применяется существующим движком; его предположение о следующем 8-часовом интервале требует отдельной проверки для каждого контракта. Биржевые ограничения количества и шага цены не полностью воспроизводятся.
+-При недоступном стакане выход может остаться неисполненным; наблюдаемый риск не ограничен плановым стопом. Возраст/оборот/спред НЕ проверяют мошенничество или токеномику.
+-Исторические логи шести сделок не содержат пути цен и ликвидаций: пересчитать достоверный результат на 50–200x из них нельзя. Старые 83.3% побед к новой версии не относятся.
++```sh
++python -m venv .venv
++# Windows: .venv\Scripts\activate
++# Linux/macOS: source .venv/bin/activate
++python -m pip install -r requirements.txt
++python -m app
++```
+ 
+-## Запуск: параметры уже в коде
+-1. Загрузить содержимое архива в корень НОВОГО GitHub-репозитория.
+-2. Подключить репозиторий к новому сервису Railway. Dockerfile и railway.toml задают сборку, запуск и проверку /health.
+-3. Для сохранения счёта и журнала при пересоздании контейнера подключить Volume к /data. Путь базы /data/paper_v040.db уже задан в Dockerfile. Без Volume база работает, но может быть потеряна при пересоздании контейнера.
+-В новом сервисе заполнять Variables НЕ требуется. Не нужно копировать .env.example в .env.
+-Встроены: DATA_MODE=live, HIGH_LEVERAGE_LAB=true, PAPER_BALANCE=1000, 115 кандидатов, MAX_ENTRY_SPREAD_BPS=10, LIQUIDATION_MIN_NOTIONAL=50000, LIQUIDATION_MIN_EVENTS=5, LIQUIDATION_MIN_VOLUME_RATIO=0.005, REVERSAL_INTERVAL_SECONDS=15.
+-DASHBOARD_TOKEN необязателен; без него страница и API статистики доступны всем, кто имеет адрес. Защиту можно включить своей переменной позже. Биржевые ключи не нужны.
+-Если сервис уже существовал, его переменные всё ещё имеют приоритет над встроенными значениями; это не проблема для нового пустого сервиса.
+-Версия на странице и в логах: v0.4.6. В старте обязательно ищите
+-`SERVICE BOOT version=0.4.6`, затем `STORAGE READY`. Четыре PAPER ACCOUNT:
+-LIQ_ROI250_*X_V040. Имена счетов и файл базы сохранены от v0.4.0 для совместимости,
+-это не старая версия кода.
+-Фильтр UNIVERSE запускается при старте. Не прошедшие отбор монеты пропускаются. При недоступности публичного REST блокируются новые сделки, панель продолжает работать. Подробные ограничения симулятора приведены выше.
++Панель: http://localhost:8000. По умолчанию DATA_MODE=live означает реальные
++публичные данные, а исполнение всегда виртуальное. Для проверки без интернета
++задайте DATA_MODE=synthetic. Для первоначального наблюдения задайте SYMBOLS=BTC_USDT.
++Параметры можно задать переменными окружения или файлом .env.
+ 
+-## Проверки
+-python tests/test_v040_unittest.py
+-8 тестов ядра прошли: лимиты ликвидации, неизвестные метаданные, глубина, net-target long/short, отсутствие преждевременного тейка, одна позиция, отбор монет, фильтры числа/объёма ликвидаций.
+-В этой среде отсутствуют dotenv/httpx/fastapi/pytest; установка зависимостей прервана сетевым тайм-аутом. Тесты ядра используют заглушку ТОЛЬКО загрузчика .env; сетевые вызовы не проверялись. compileall прошёл. Полный сервис и реальный приём расширенного потока не проверены. Следующий обязательный этап — бумажный запуск и наблюдение логов.
++Тесты: `python -m pip install pytest`, затем `python -m pytest tests scenario_model`.
+ 
+-## Отдельная математическая модель
+-python scenario_model/model.py --out scenario_results.json
+-Сравнивает 20/50/100/200x при стопе -50% маржи, цели +250%, риске 0.5% счёта. Эти параметры отличаются от основного бота с волатильностным стопом и риском 0.25%.
+-Допущения: комиссия 0.08% и проскальзывание 0.01% за сторону, funding=0 базово; MMR=0.4% условно. Это сценарии, НЕ актуальная тарифная рекомендация и НЕ исторический бэктест. Stress: проскальзывание 0.1% за сторону, funding 0.01% номинала.
+-Replay одной выбранной сделки: python scenario_model/model.py --ticks market.csv --entry 100 --leverage 50 --side LONG. CSV ts,mark,bid,ask,funding_fraction: Unix seconds по возрастанию, первая строка соответствует входу; funding_fraction — отдельный платёж/исходный номинал (плюс = расход). Пропуски тиков могут скрыть стоп/ликвидацию. Сам replay не создаёт сигналы. Ликвидации отмечаются APPROX_LIQUIDATION без выдуманного PnL.
++## Что изменено
+ 
+-Источники форматов и определения PnL:
+-https://bybit-exchange.github.io/docs/v5/market/instrument
+-https://bybit-exchange.github.io/docs/v5/market/tickers
+-https://www.bybit.com/en/help-center/article/Profit-Loss-calculations-USDT-Contract
++- Нет выдуманных метаданных, размера контракта, MMR и разрешения API.
++- Universe требует проверенные MEXC-метаданные, apiAllowed=true, минимум 200
++  завершённых часовых свечей и свежий узкий стакан. Это локальный фильтр;
++  проверок возраста 180 дней и оборота 10 млн в рабочем MEXC-пути нет.
++- При отсутствии ликвидаций обычный поток сделок не заменяет liquidation-сигнал.
++- Bybit поставляет сделки, стакан, OI и ликвидации. Его funding не применяется к MEXC.
++- Исчезла подстановка следующего funding через условные 8 часов.
++- Ошибка основной SQLite завершает запуск; временная база больше не подменяет счёт.
++- Закрытые сделки и состояния счетов фиксируются одной транзакцией каждого тика.
++  При ошибке до фиксации изменения счёта откатываются в памяти.
++- Проверка метаданных и повтор загрузки недостающей истории выполняются раз в 5 минут.
++- /health возвращает HTTP 503, если движок не запустился, отстал или сообщил ошибку.
++  Исправность движка не равна допуску к торговле: смотрите /api/status и /api/diagnostics.
++
++## Ограничения и подключение бота
++
++Смотрите AUDIT_RU.md: это обязательное описание границ достоверности, а не
++утверждение готовности к реальным деньгам. Funding и ликвидация всё ещё приближённые;
++не реализованы полноценные risk tiers, mark-price settlement, округление заявок,
++reconciliation с биржей и восстановление пропущенных рыночных событий.
++
++Четыре независимых счёта по 1000 USDT: 20/50/100/200x. Цель 250% относится к
++начальной марже позиции, а не ко всему счёту. При текущем стопе 200x закономерно
++блокируется. Настройки комиссии — предположение симуляции, не тариф вашего аккаунта.
++
++Бот сигналов может читать /api/status, /api/diagnostics, /api/signals и /api/trades.
++Используйте заголовок X-Dashboard-Token и задайте DASHBOARD_TOKEN; без токена панель
++публична. Числовой score не является вероятностью успеха или прогнозом доходности.
++Превращение сигнала в реальную заявку требует отдельного execution-контура из отчёта.
++
++Для Railway сохранён Dockerfile: подключите постоянный Volume /data. Перед обновлением
++сделайте резервную копию SQLite. Схема БД и названия счетов совместимы, но статистику
++0.4.6 и 0.4.7 нельзя смешивать: правила допуска и состав сигналов изменились.
++Для чистого эксперимента задайте новый DB_PATH, например /data/paper_v047.db.
+--- a/research_checks.py
++++ b/research_checks.py
+@@ -0,0 +1,60 @@
++"""Reproducible checks of the implemented rules; not a historical backtest."""
++import json
++from dataclasses import replace
++from pathlib import Path
++
++from app.config import Settings, account_configs
++from app.market import MarketState
++from app.models import FeatureSnapshot, Side, Signal
++from app.paper import PaperBroker
++from app.strategy import CompositeFlowStrategy, MarketRegime
++
++
++def calculate():
++    settings = replace(Settings.from_env(), symbols=('BTC_USDT',), data_mode='live')
++    rows = []
++    for mmr in (.001, .005):
++        for stop in (.006, .012, .018, .025):
++            market = MarketState(settings.symbols)
++            state = market.symbol('BTC_USDT')
++            state.contract_metadata_ready = state.api_allowed = True
++            state.contract_max_leverage = 500
++            state.maintenance_margin_rate = mmr
++            state.universe_valid_until = 2000
++            state.book('mexc').apply_snapshot([[99.995,10000]],[[100.005,10000]],ts=1000)
++            broker = PaperBroker(market, settings, account_configs(settings))
++            signal = Signal('BTC_USDT','composite','LIQUIDATION_EXHAUSTION',Side.LONG,95,stop,1.8,1000)
++            opened = {p.leverage:p for p in broker.handle_signal(signal,1000)}
++            for account in broker.accounts.values():
++                lev = account.max_leverage
++                position = opened.get(lev)
++                decision = broker.entry_decisions[f'{account.name}:BTC_USDT']
++                rows.append(dict(mmr=mmr, stop_pct=stop*100, leverage=lev,
++                    approx_liquidation_distance_pct=(1/lev-mmr-2*settings.taker_fee_rate)*100,
++                    result=decision['reason'],
++                    notional=position.notional if position else None,
++                    initial_margin=position.margin if position else None,
++                    planned_risk=position.initial_risk_usdt if position else None,
++                    target_move_pct=(position.target_price/position.entry_price-1)*100 if position else None,
++                    target_net_profit=2.5*position.margin if position else None))
++    regimes = []
++    for side in (Side.LONG,Side.SHORT):
++        for name,direction in [('RANGE',0),('STRESS',-1),('TREND_UP',1),('TREND_DOWN',-1)]:
++            feature = FeatureSnapshot('BTC_USDT',1000,100,1,True,
++                price_position=0 if side == Side.LONG else 1,
++                flow_fast=.6*side,flow_slow=.4*side,book_imbalance=.5*side,
++                microprice_bps=2*side,cross_venue_consensus=.5*side,
++                liquidation_imbalance=-.9*side,liquidation_notional_300s=75000,
++                liquidation_events_300s=5,bybit_volume_300s=1000000,atr_pct=.002)
++            strategy = CompositeFlowStrategy(settings)
++            signal = strategy._reversal_candidate(state,feature,MarketRegime(name,direction,.5,0),1000)
++            regimes.append(dict(side=side.label,regime=name,signal=bool(signal),
++                score=signal.score if signal else None,
++                blocker=strategy.last_diagnostics['BTC_USDT'].get('reversal_blocker','')))
++    return {'kind':'deterministic_rule_checks_not_backtest', 'sizing':rows,'regimes':regimes}
++
++
++if __name__ == '__main__':
++    output = Path('research_checks.json')
++    output.write_text(json.dumps(calculate(),ensure_ascii=False,indent=2),encoding='utf-8')
++    print(output.resolve())
+--- a/START_RU.txt
++++ b/START_RU.txt
+@@ -1,29 +1,11 @@
+-LIQUIDATION LAB v0.4.6 — PAPER ONLY
++LIQUIDATION LAB 0.4.7 — PAPER ONLY
+ 
+-Что включено:
+-- MEXC — цены, стакан и виртуальное исполнение;
+-- Bybit WebSocket — только ликвидации, Bybit REST не блокирует торговлю;
+-- Binance — дополнительное подтверждение потока;
+-- четыре виртуальных счёта: 20x / 50x / 100x / 200x;
+-- liquidation exhaustion разрешён в направлении режима: TREND_DOWN → SHORT,
+-  TREND_UP → LONG; в RANGE/STRESS разрешены подтверждённые развороты;
+-- реальные заявки и API-ключи не используются.
++Начните с README_RU.md и AUDIT_RU.md.
++Быстрый запуск: python -m pip install -r requirements.txt && python -m app
++Панель: http://localhost:8000
++Проверка: python -m pytest tests scenario_model
+ 
+-Установка:
+-1. Замени содержимое корня GitHub-репозитория файлами из этого архива.
+-2. В Railway сделай Deploy из нового коммита или Redeploy latest commit.
+-3. Подключи Railway Volume с mount path `/data`.
+-4. Variables не нужны; `DB_PATH=/data/paper_v040.db` задан в Dockerfile.
+-
+-Проверка старта:
+-- `SERVICE BOOT version=0.4.6` — реально запущена новая версия;
+-- `STORAGE READY path=/data/paper_v040.db` — журнал постоянный;
+-- `STORAGE NONPERSISTENT FALLBACK` — volume недоступен, paper продолжает работать,
+-  но журнал будет временным;
+-- `UNIVERSE VERIFIED` — монеты допущены к расчёту;
+-- `PAPER STATUS` — heartbeat каждые 30 секунд;
+-- `PAPER OPEN` / `PAPER CLOSE` — виртуальные сделки.
+-
+-Если сделок нет, поле `blockers=` в `PAPER STATUS` показывает точную причину.
+-Стратегия не гарантирует прибыль; большое плечо используется только в виртуальном
+-эксперименте.
++Live означает только публичные рыночные данные. Реальных заявок нет.
++В Railway требуется доступная постоянная база /data. При её отказе запуск
++останавливается: новый временный счёт больше не создаётся.
++Не ослабляйте фильтры ради появления сделок: причина блокировки — часть результата.
+--- a/STRATEGY_REVIEW_RU.md
++++ b/STRATEGY_REVIEW_RU.md
+@@ -0,0 +1,95 @@
++# Как фактически работает стратегия и что мешало входам
++
++Это разбор кода из предоставленного архива. Старой рабочей версии и журнала
++сделок пока нет: совпадение с её поведением нельзя подтвердить.
++
++## Основа, которую удалось восстановить из кода
++
++1. За последние 5 минут минимум 5 ликвидаций Bybit и объём не ниже максимума
++   из 50 000 USDT и 0.5% объёма сделок Bybit за эти же 5 минут.
++2. Цена MEXC в нижних 10% диапазона за 30 минут даёт кандидата LONG; в верхних
++   10% — SHORT. Для LONG нужен перевес ликвидационных продаж, для SHORT — покупок.
++3. Поток обычных сделок и стакан должны подтверждать обратное направление.
++   Это покупка после ликвидационного падения или продажа после выноса вверх.
++4. Эвристическая оценка должна достичь 86. Максимум оценки достижим: отдельные
++   тесты полного пути получили реальные сигналы и входы в обе стороны.
++5. Затем идут независимые проверки брокера: Universe, занятость счёта, пауза,
++   лимит риска, metadata, плечо, расстояние до ликвидации, глубина и спред.
++
++В коде НЕТ формального доказательства «ликвидации закончились»: нет отдельной
++машины состояний вынос → затухание → подтверждение. Есть одновременная комбинация
++условий внутри окон. Это точное описание имеющейся стратегии, не обещание её edge.
++
++## Что было добавлено поверх основы
++
++- Фильтр глобального режима запрещает LONG после падения при TREND_DOWN и SHORT
++  после роста при TREND_UP. Такой фильтр может отбрасывать именно контртрендовый
++  отскок. Это изменение поведения, а не ошибка транспорта.
++- SYSTEMATIC_BREAKOUT_4H — отдельная стратегия пробоя 20 четырёхчасовых баров;
++  в high-leverage режиме добавлена только для SHORT при TREND_DOWN. Для LONG
++  симметричного разрешения нет. Смешивать её статистику с liquidation нельзя.
++- MEXC_FLOW_EXHAUSTION заменял отсутствующие ликвидации обычным потоком — удалён.
++- Router требовал минимум 10 готовых инструментов, даже если настроен один.
++  Теперь порог не превышает размер активного пула; остальные критерии готовности
++  и прогрева сохранены. Причины теперь видны также в панели.
++- Сигнал задаёт target_r=1.8, но HIGH_LEVERAGE_LAB игнорирует его и выставляет
++  цель 250% начальной маржи. Это существенно другой выход.
++
++Фильтр направления и разрешение SHORT-пробоя пока сохранены как в 0.4.6.
++Без старой рабочей версии нельзя честно объявить их удаление «восстановлением».
++
++## Расчёт риска и цели на реализованном движке
++
++Допущения сценария: баланс 1000 USDT, риск 0.25%, LONG, стоп 0.6%, taker fee
++0.08% за сторону, минимальное проскальзывание 0.005% за сторону, узкий стакан,
++MMR=0.1%, funding=0. Это входные параметры, не актуальный тариф аккаунта.
++
++| Плечо | Номинал, USDT | Начальная маржа | Плановый риск | Движение до расчётной цели | Чистая цель, USDT | Решение |
++|---|---:|---:|---:|---:|---:|---|
++| 20× | 322.58 | 16.13 | 2.48 | 12.68% | 40.32 | допуск |
++| 50× | 322.58 | 6.45 | 2.48 | 5.17% | 16.13 | допуск |
++| 100× | — | — | — | — | — | стоп не помещается |
++| 200× | — | — | — | — | — | стоп не помещается |
++
++При 20× цель получается около 16.2R, при 50× — около 6.5R, хотя сигнал просит
++1.8R. Короткий отскок может завершиться раньше этой цели; через 1R ещё включается
++перенос стопа. Это одна из ключевых причин, почему после переделки результат
++может сильно отличаться от старого. Эти числа не дают win rate или доходность.
++
++При фиксированном риске номинал позиции здесь одинаков для 20× и 50×. Плечо
++меняет занятую маржу и расстояние до ликвидации, а не автоматически прибыль
++в USDT при одинаковом движении. Для сопоставления плеч нельзя одновременно
++менять выход на разные движения цены и считать, что сравнивается только плечо.
++
++Проверены 32 сочетания MMR, стопа и плеча настоящим PaperBroker. Результаты,
++включая точные причины отказа: research_checks.json. Повтор: python research_checks.py.
++
++## Проверка фильтра направления при одинаковом сильном развороте
++
++| Кандидат | Режим | Пропускает | Причина отказа |
++|---|---|---|---|
++| LONG | RANGE | да | — |
++| LONG | STRESS | да | — |
++| LONG | TREND_UP | да | — |
++| LONG | TREND_DOWN | нет | liquidation_opposes_regime |
++| SHORT | RANGE | да | — |
++| SHORT | STRESS | да | — |
++| SHORT | TREND_UP | нет | liquidation_opposes_regime |
++| SHORT | TREND_DOWN | да | — |
++
++Таким образом, цепочка не является математически «мёртвой» целиком. Но часть
++плеч заведомо недоступна, а фильтр направления меняет саму идею контртрендового
++разворота. Восстановить исходную стратегию нужно по последней рабочей версии,
++затем сравнивать новые модули в отдельных экспериментах на одном потоке событий.
++
++## Что проверено дополнительно
++
++Полный путь в LONG и SHORT: сообщения allLiquidation → признаки рынка → Router
++→ LIQUIDATION_EXHAUSTION → открытие 20×/50× → чистый TARGET 50×. Для воспроизводимости
++используется искусственный контролируемый рынок, а не подставленный готовый Signal.
++Отдельно исправлен расчёт глубины закрытия: теперь проходится фиксированное
++количество позиции по уровням стакана. Недостаток количества блокирует fill.
++
++В diagnostics добавлены причины последнего решения брокера по счёту/монете:
++дата, плечо, стоп, расчётная дистанция ликвидации, причина отказа или открытие.
++Это отделяет отсутствие сигнала от сигнала, который нельзя исполнить.
+--- a/tests/test_pipeline.py
++++ b/tests/test_pipeline.py
+@@ -0,0 +1,100 @@
++"""Deterministic liquidation -> feature -> signal -> paper fill -> close checks."""
++import json
++import time
++import unittest
++from dataclasses import replace
++
++from app.config import Settings, account_configs
++from app.feeds.bybit import BybitFeed
++from app.market import MarketState
++from app.models import Side, TradeEvent, MinuteBar
++from app.orderbook import OrderBook
++from app.paper import PaperBroker
++from app.strategy import StrategyRouter
++
++
++class Pipeline(unittest.IsolatedAsyncioTestCase):
++    async def test_both_liquidation_directions_reach_real_strategy_and_broker(self):
++        for side in (Side.LONG, Side.SHORT):
++            with self.subTest(side=side):
++                now = time.time()
++                settings = replace(Settings.from_env(), symbols=('BTC_USDT',),
++                    data_mode='live', startup_warmup_seconds=0, regime_confirm_seconds=0)
++                market = MarketState(settings.symbols)
++                state = market.symbol('BTC_USDT')
++                state.contract_metadata_ready = True
++                state.contract_max_leverage = 200
++                state.api_allowed = True
++                state.maintenance_margin_rate = .005
++                state.universe_valid_until = now+3600
++                state.bootstrap_hours((int(now)-3600*i, 100) for i in range(201, 0, -1))
++                minute = int(now//60)*60
++                state.bootstrap_minutes(MinuteBar(minute-60*i,100,100.02,99.98,100,1000)
++                                        for i in range(40,0,-1))
++                # A 30-minute extreme, followed by aggressive trades in the reversal direction.
++                for i in range(1801):
++                    price = 101-i/1800 if side == Side.LONG else 99+i/1800
++                    state.record_price('mexc', price, now-1801+i)
++                for venue in ('mexc', 'bybit'):
++                    state.book(venue).apply_snapshot(
++                        [[99.995, 1000 if side == Side.LONG else 100]],
++                        [[100.005, 100 if side == Side.LONG else 1000]], ts=now)
++                    for i in range(30):
++                        state.add_trade(TradeEvent('BTC_USDT', venue, 100, 10, side, now-30+i))
++                feed = BybitFeed(market, settings)
++                # Bybit Buy = liquidated long -> selling pressure -> LONG reversal.
++                await feed._handle({'topic': 'allLiquidation.BTCUSDT', 'ts': now*1000,
++                    'data': [{'s': 'BTCUSDT', 'S': 'Buy' if side == Side.LONG else 'Sell',
++                              'p': '100', 'v': '150', 'T': (now-i)*1000} for i in range(5)]})
++                feature = state.features(now, settings.stale_after_seconds)
++                self.assertTrue(feature.data_ready)
++                self.assertEqual(feature.liquidation_events_300s, 5)
++                self.assertEqual(feature.liquidation_notional_300s, 75000)
++                self.assertEqual(feature.liquidation_imbalance, -int(side))
++                router = StrategyRouter(settings)
++                signals = router.evaluate_all(market.symbols, {'BTC_USDT': feature}, now)
++                self.assertEqual(len(signals), 1, router.diagnostics())
++                signal = signals[0]
++                self.assertEqual(signal.setup, 'LIQUIDATION_EXHAUSTION')
++                self.assertEqual(signal.side, side)
++                broker = PaperBroker(market, settings, account_configs(settings))
++                positions = broker.handle_signal(signal, now)
++                self.assertEqual([p.leverage for p in positions], [20, 50])
++                position = positions[1]
++                target = position.entry_price*(1+int(side)*.055)
++                state.book('mexc').apply_snapshot([[target-.001,1000]], [[target+.001,1000]], ts=now+1)
++                trades = broker.evaluate_positions({}, now+1)
++                target_trades = [t for t in trades if t.leverage == 50]
++                self.assertEqual(len(target_trades), 1)
++                self.assertEqual(target_trades[0].reason, 'TARGET')
++                self.assertGreaterEqual(target_trades[0].net_roi_pct, 250)
++
++    async def test_exit_depth_walks_quantity_not_entry_notional(self):
++        book = OrderBook('mexc', 'BTC_USDT')
++        book.apply_snapshot([[100, 1], [90, 1]], [[101, 1], [110, 1]])
++        self.assertAlmostEqual(book.quantity_impact_bps(Side.SHORT, 2), 500)
++        self.assertAlmostEqual(book.quantity_impact_bps(Side.LONG, 2), (105.5/101-1)*10000)
++        self.assertEqual(book.quantity_impact_bps(Side.LONG, 2.01), float('inf'))
++
++    async def test_crossed_and_nonfinite_book_cannot_supply_bbo(self):
++        book = OrderBook('mexc', 'BTC_USDT')
++        book.apply_snapshot([[102,1]],[[101,1]])
++        self.assertIsNone(book.best_bid_ask())
++        book.apply_snapshot([[100,float('inf')]],[[101,1]])
++        self.assertIsNone(book.best_bid_ask())
++
++    async def test_rejection_explains_impossible_leverage(self):
++        settings = replace(Settings.from_env(), symbols=('BTC_USDT',), data_mode='live')
++        market = MarketState(settings.symbols)
++        state = market.symbol('BTC_USDT')
++        state.universe_valid_until = 2000
++        state.contract_metadata_ready = state.api_allowed = True
++        state.contract_max_leverage = 500
++        broker = PaperBroker(market,settings,account_configs(settings))
++        from app.models import Signal
++        signal = Signal('BTC_USDT','composite','LIQUIDATION_EXHAUSTION',Side.LONG,95,.006,1.8,1000)
++        account = list(broker.accounts.values())[-1]
++        self.assertIsNone(broker.open_from_signal(account,signal,1000))
++        decision = broker.entry_decisions[f'{account.name}:BTC_USDT']
++        self.assertEqual(decision['reason'],'stop_outside_liquidation_buffer')
++        self.assertLess(decision['liquidation_distance_pct'],decision['required_stop_buffer_pct'])
+--- a/tests/test_regressions.py
++++ b/tests/test_regressions.py
+@@ -0,0 +1,176 @@
++import asyncio
++import json
++import sqlite3
++import time
++import unittest
++from dataclasses import replace
++from pathlib import Path
++from tempfile import TemporaryDirectory
++from unittest.mock import AsyncMock, patch
++
++from app.config import Settings, account_configs
++from app.feeds.bybit import BybitFeed
++from app.feeds.mexc import MexcFeed
++from app.market import MarketState
++from app.models import FeatureSnapshot, Side, Signal
++from app.paper import PaperBroker
++from app.service import PaperTradingService
++from app.storage import Storage
++from app.strategy import CompositeFlowStrategy, MarketRegime
++from app.universe import UniverseGate
++
++
++class Regressions(unittest.IsolatedAsyncioTestCase):
++    def setUp(self):
++        self.settings = replace(Settings.from_env(), symbols=('BTC_USDT',), data_mode='live')
++        self.market = MarketState(self.settings.symbols)
++        self.state = self.market.symbol('BTC_USDT')
++        self.now = time.time()
++        self.state.book('mexc').apply_snapshot([[100, 100]], [[100.01, 100]], ts=self.now)
++
++    async def test_universe_does_not_invent_metadata(self):
++        gate = UniverseGate()
++        await gate.refresh_mexc_only(self.settings.symbols, self.market)
++        self.assertEqual(gate.eligible_count, 0)
++        self.assertFalse(self.state.contract_metadata_ready)
++        self.assertEqual(self.state.contract_max_leverage, 0)
++
++    async def test_universe_requires_permission_history_and_fresh_book(self):
++        gate = UniverseGate()
++        self.state.contract_metadata_ready = True
++        self.state.api_allowed = False
++        self.state.bootstrap_hours((int(self.now)-3600*(i+2), 100) for i in range(200))
++        await gate.refresh_mexc_only(self.settings.symbols, self.market)
++        self.assertEqual(gate.eligible_count, 0)
++        self.state.api_allowed = True
++        await gate.refresh_mexc_only(self.settings.symbols, self.market)
++        self.assertEqual(gate.eligible_count, 1)
++        self.state.hour_closes.clear()
++        await gate.refresh_mexc_only(self.settings.symbols, self.market)
++        self.assertEqual(gate.eligible_count, 0)
++        self.assertEqual(self.state.universe_valid_until, 0)
++
++    async def test_empty_and_incomplete_contract_responses_rejected(self):
++        feed = MexcFeed(self.market, self.settings)
++        for payload in ({}, {'symbol': 'BTC_USDT'}, {'symbol': 'OTHER_USDT'}):
++            feed._get = AsyncMock(return_value=payload)
++            with self.assertRaises((ValueError, KeyError)):
++                await feed._load_contract('BTC_USDT')
++            self.assertFalse(self.state.contract_metadata_ready)
++
++    async def test_metadata_contract_units_and_regional_leverage(self):
++        feed = MexcFeed(self.market, self.settings)
++        feed._get = AsyncMock(return_value=dict(
++            symbol='BTC_USDT', contractSize=.0001, maintenanceMarginRate=.005,
++            maxLeverage=200, countryConfigContractMaxLeverage=50, state=0,
++            quoteCoin='USDT', settleCoin='USDT', futureType=1, apiAllowed=True))
++        await feed._load_contract('BTC_USDT')
++        self.assertTrue(self.state.contract_metadata_ready)
++        self.assertEqual(self.state.contract_max_leverage, 50)
++        self.assertIsNone(self.state.book('mexc').best_bid_ask())
++        await feed._handle(json.dumps(dict(channel='push.depth.full', symbol='BTC_USDT',
++            ts=self.now*1000, data={'bids': [[100, 100]], 'asks': [[100.01, 100]]})))
++        self.assertAlmostEqual(self.state.book('mexc').bids[100], .01)
++
++    async def test_bybit_funding_cannot_overwrite_mexc(self):
++        self.state.funding_rate = .001
++        self.state.next_funding_at = 12345
++        feed = BybitFeed(self.market, self.settings)
++        await feed._handle({'topic': 'tickers.BTCUSDT', 'data': {
++            'symbol': 'BTCUSDT', 'fundingRate': '.9', 'nextFundingTime': '99999999',
++            'openInterest': '100'}})
++        self.assertEqual(self.state.funding_rate, .001)
++        self.assertEqual(self.state.next_funding_at, 12345)
++        self.assertEqual(self.state.oi_history[-1][1], 100)
++
++    async def test_no_liquidations_cannot_create_proxy_signal(self):
++        f = FeatureSnapshot('BTC_USDT', self.now, 100, 1, True,
++                            trade_count_60s=100, flow_fast=-.9, book_imbalance=-.8)
++        strategy = CompositeFlowStrategy(self.settings)
++        self.assertIsNone(strategy._reversal_candidate(self.state, f, MarketRegime('RANGE', 0, .5, 0), self.now))
++        self.assertEqual(strategy.last_diagnostics['BTC_USDT']['reversal_blocker'], 'liquidation_too_few_events')
++
++    async def test_storage_failure_cannot_start_a_different_account(self):
++        with TemporaryDirectory() as d:
++            storage = Storage(Path(d)/'paper.db')
++            with patch('app.storage.sqlite3.connect', side_effect=sqlite3.OperationalError('denied')) as connect:
++                with self.assertRaises(sqlite3.OperationalError):
++                    await storage.initialise()
++                self.assertEqual(connect.call_count, 1)
++            self.assertEqual(storage.path, Path(d)/'paper.db')
++
++    async def test_checkpoint_is_atomic_and_survives_restart(self):
++        settings = replace(self.settings, data_mode='synthetic')
++        broker = PaperBroker(self.market, settings, account_configs(settings))
++        signal = Signal('BTC_USDT', 'composite', 'LIQUIDATION_EXHAUSTION', Side.LONG, 95, .006, 1.8, self.now)
++        account = next(iter(broker.accounts.values()))
++        position = broker.open_from_signal(account, signal, self.now)
++        self.assertIsNotNone(position)
++        with TemporaryDirectory() as d:
++            path = Path(d)/'paper.db'
++            storage = Storage(path)
++            await storage.initialise()
++            await storage.save_checkpoint(self.now, [], broker.snapshots())
++            trade = broker.close_position(account, position, 'TEST', self.now+1)
++            with self.assertRaises(ValueError):
++                await storage.save_checkpoint(self.now+1, [trade], {'bad': {'value': float('nan')}})
++            self.assertEqual(await storage.recent_trades(), [])
++            restored = await storage.load_account_states()
++            self.assertEqual(len(restored[account.name]['positions']), 1)
++            await storage.save_checkpoint(self.now+1, [trade], broker.snapshots())
++            await storage.close()
++            storage = Storage(path)
++            await storage.initialise()
++            restored_broker = PaperBroker(self.market, settings, account_configs(settings))
++            restored_broker.restore(await storage.load_account_states())
++            self.assertEqual(restored_broker.accounts[account.name].positions, {})
++            self.assertAlmostEqual(restored_broker.accounts[account.name].balance, account.balance)
++            self.assertEqual(len(await storage.recent_trades()), 1)
++            await storage.close()
++
++    async def test_synthetic_service_starts_stops_and_restores(self):
++        with TemporaryDirectory() as d:
++            settings = replace(self.settings, data_mode='synthetic', db_path=Path(d)/'paper.db', evaluation_interval_seconds=.05)
++            service = PaperTradingService(settings)
++            await service.start()
++            await asyncio.sleep(.2)
++            self.assertGreater(service.last_engine_tick, 0)
++            self.assertEqual(service.last_engine_error, '')
++            balances = service.broker.snapshots()
++            await service.stop()
++            restored = PaperTradingService(settings)
++            await restored.start()
++            self.assertEqual(restored.broker.snapshots(), balances)
++            await restored.stop()
++
++    async def test_engine_failure_rolls_back_account_changes(self):
++        with TemporaryDirectory() as d:
++            settings = replace(self.settings, data_mode='synthetic', db_path=Path(d)/'paper.db', evaluation_interval_seconds=.05)
++            service = PaperTradingService(settings)
++            await service.storage.initialise()
++            account = next(iter(service.broker.accounts.values()))
++            before = account.balance
++            def mutate(*args):
++                account.balance -= 100
++                return []
++            service.broker.evaluate_positions = mutate
++            service.storage.save_checkpoint = AsyncMock(side_effect=sqlite3.OperationalError('disk full'))
++            task = asyncio.create_task(service._engine_loop())
++            await asyncio.sleep(.02)
++            self.assertEqual(service.broker.accounts[account.name].balance, before)
++            self.assertEqual(service.last_engine_error, 'disk full')
++            service._stopping = True
++            await task
++            await service.storage.close()
++
++    async def test_health_http_status_reflects_engine_failure(self):
++        from app import api
++        with patch.object(api, 'service') as service:
++            service.last_engine_tick = time.time()
++            service.last_engine_error = ''
++            self.assertEqual((await api.health()).status_code, 200)
++            service.last_engine_error = 'disk full'
++            self.assertEqual((await api.health()).status_code, 503)
++            service.last_engine_error = ''
++            service.last_engine_tick = time.time() - 60
++            self.assertEqual((await api.health()).status_code, 503)
+--- a/tests/test_v040_unittest.py
++++ b/tests/test_v040_unittest.py
+@@ -25,11 +25,11 @@
+   s,m,b=self.setup_broker(True);opened=b.handle_signal(self.sig(),1000)
+   self.assertEqual([p.leverage for p in opened],[20,50])
+   self.assertTrue(all(p.initial_risk_usdt<=2.5 for p in opened))
+- def test_mexc_flow_exhaustion_is_executable_in_high_leverage_lab(self):
++ def test_mexc_flow_exhaustion_is_rejected_in_high_leverage_lab(self):
+   s,m,b=self.setup_broker(True)
+   signal=replace(self.sig(),setup='MEXC_FLOW_EXHAUSTION')
+   opened=b.handle_signal(signal,1000)
+-  self.assertEqual([p.leverage for p in opened],[20,50])
++  self.assertEqual(opened,[])
+  def test_missing_metadata_blocks_all(self):
+   s,m,b=self.setup_broker(True);m.symbol('BTC_USDT').contract_metadata_ready=False
+   self.assertEqual(b.handle_signal(self.sig(),1000),[])

@@ -1,0 +1,312 @@
+from __future__ import annotations
+
+import asyncio
+import gzip
+import json
+import logging
+import math
+import time
+from contextlib import suppress
+from typing import Any
+
+import httpx
+import websockets
+
+from ..config import Settings
+from ..market import MarketState
+from ..models import MinuteBar, Side, TradeEvent
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+class MexcFeed:
+    name = "mexc"
+    rest_url = "https://api.mexc.com"
+    ws_url = "wss://contract.mexc.com/edge"
+
+    def __init__(self, market: MarketState, settings: Settings) -> None:
+        self.market = market
+        self.settings = settings
+        self._stop = asyncio.Event()
+        self._http: httpx.AsyncClient | None = None
+        self._request_lock = asyncio.Lock()
+        self._last_request_at = 0.0
+
+    async def bootstrap(self) -> None:
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=15.0, headers={"Language": "en-US"})
+        # MEXC throttles the public contract/kline endpoints aggressively.
+        # Keep bootstrap deliberately gentle so a larger candidate pool does
+        # not turn into a burst of "Requests are too frequent" responses.
+        semaphore = asyncio.Semaphore(2)
+
+        async def load(symbol: str) -> None:
+            async with semaphore:
+                for attempt in range(3):
+                    try:
+                        await self._load_contract(symbol)
+                        if len(self.market.symbol(symbol).hour_closes) < 200:
+                            await self._load_klines(symbol)
+                        await self._load_funding(symbol)
+                        return
+                    except Exception as exc:  # feed retries live even if bootstrap is partial
+                        if attempt == 2:
+                            LOGGER.warning("MEXC bootstrap failed for %s: %s", symbol, exc)
+                        else:
+                            await asyncio.sleep(2.0 * (attempt + 1))
+
+        await asyncio.gather(*(load(symbol) for symbol in self.settings.symbols))
+
+    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=15.0, headers={"Language": "en-US"})
+        async with self._request_lock:
+            wait = 0.25 - (time.monotonic() - self._last_request_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request_at = time.monotonic()
+        response = await self._http.get(f"{self.rest_url}{path}", params=params)
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("success", False):
+            raise RuntimeError(payload.get("message") or f"MEXC error {payload.get('code')}")
+        return payload.get("data")
+
+    async def _load_contract(self, symbol: str) -> None:
+        state = self.market.symbol(symbol)
+        state.contract_metadata_ready = False
+        state.api_allowed = False
+        data = await self._get("/api/v1/contract/detail/country", {"symbol": symbol})
+        if isinstance(data, list):
+            data = next((item for item in data if item.get("symbol") == symbol), {})
+        if not isinstance(data, dict) or data.get("symbol") != symbol:
+            raise ValueError(f"Missing contract metadata: {symbol}")
+        size = float(data["contractSize"])
+        mmr = float(data["maintenanceMarginRate"])
+        leverage = float(data["maxLeverage"])
+        regional = float(data.get("countryConfigContractMaxLeverage") or 0)
+        if regional > 0:
+            leverage = min(leverage, regional)
+        if not all(math.isfinite(v) for v in (size, mmr, leverage, regional)):
+            raise ValueError("Non-finite contract metadata")
+        if size <= 0 or not 0 < mmr < 1 or leverage < 1:
+            raise ValueError("Invalid contract limits")
+        if (data.get("state") != 0 or data.get("quoteCoin") != "USDT"
+                or data.get("settleCoin") != "USDT" or data.get("futureType") != 1
+                or data.get("preMarket", False)):
+            raise ValueError("Inactive or unsupported contract")
+        if state.contract_size != size:
+            # Books/trades received before metadata used unknown contract units.
+            book = state.book("mexc")
+            book.bids.clear(); book.asks.clear(); book.updated_at = 0
+            state.trades["mexc"].clear()
+        state.contract_size = size
+        state.maintenance_margin_rate = mmr
+        state.contract_max_leverage = leverage
+        state.api_allowed = data.get("apiAllowed") is True
+        state.contract_metadata_ready = True
+
+    async def _load_klines(self, symbol: str) -> None:
+        now = int(time.time())
+        minute_data, hour_data = await asyncio.gather(
+            self._get(
+                f"/api/v1/contract/kline/{symbol}",
+                {"interval": "Min1", "start": now - 420 * 60, "end": now},
+            ),
+            self._get(
+                f"/api/v1/contract/kline/{symbol}",
+                {"interval": "Min60", "start": now - 320 * 3_600, "end": now},
+            ),
+        )
+        if isinstance(minute_data, dict):
+            times = minute_data.get("time", [])
+            opens = minute_data.get("open", [])
+            highs = minute_data.get("high", [])
+            lows = minute_data.get("low", [])
+            closes = minute_data.get("close", [])
+            amounts = minute_data.get("amount", minute_data.get("vol", []))
+            count = min(map(len, (times, opens, highs, lows, closes, amounts))) if times else 0
+            bars = [
+                MinuteBar(
+                    ts=int(times[index]),
+                    open=float(opens[index]),
+                    high=float(highs[index]),
+                    low=float(lows[index]),
+                    close=float(closes[index]),
+                    volume_notional=float(amounts[index]),
+                )
+                for index in range(count)
+            ]
+            self.market.symbol(symbol).bootstrap_minutes(bars)
+        if isinstance(hour_data, dict):
+            times = hour_data.get("time", [])
+            opens = hour_data.get("open", [])
+            highs = hour_data.get("high", [])
+            lows = hour_data.get("low", [])
+            closes = hour_data.get("close", [])
+            amounts = hour_data.get("amount", hour_data.get("vol", []))
+            count = min(map(len, (times, opens, highs, lows, closes, amounts))) if times else 0
+            bars = [
+                MinuteBar(
+                    ts=int(times[index]),
+                    open=float(opens[index]),
+                    high=float(highs[index]),
+                    low=float(lows[index]),
+                    close=float(closes[index]),
+                    volume_notional=float(amounts[index]),
+                )
+                for index in range(count)
+            ]
+            self.market.symbol(symbol).bootstrap_hour_bars(bars)
+            self.market.symbol(symbol).bootstrap_hours(
+                (int(ts), float(close)) for ts, close in zip(times, closes)
+            )
+
+    async def _load_funding(self, symbol: str) -> None:
+        data = await self._get(f"/api/v1/contract/funding_rate/{symbol}")
+        if not isinstance(data, dict):
+            return
+        next_settle = float(data.get("nextSettleTime") or 0.0)
+        if next_settle > 10_000_000_000:
+            next_settle /= 1000.0
+        self.market.symbol(symbol).update_derivatives(
+            ts=time.time(),
+            funding_rate=float(data.get("fundingRate") or data.get("rate") or 0.0),
+            next_funding_at=next_settle,
+        )
+
+    def subscription_messages(self) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        for symbol in self.settings.symbols:
+            messages.extend(
+                (
+                    {"method": "sub.deal", "param": {"symbol": symbol}},
+                    {
+                        "method": "sub.depth.full",
+                        "param": {"symbol": symbol, "limit": 20},
+                    },
+                    {
+                        "method": "sub.funding.rate",
+                        "param": {"symbol": symbol},
+                        "gzip": False,
+                    },
+                )
+            )
+        return messages
+
+    async def run(self) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=None,
+                    close_timeout=5,
+                    max_size=8 * 1024 * 1024,
+                ) as ws:
+                    self.market.feed_connected(self.name)
+                    backoff = 1.0
+                    for message in self.subscription_messages():
+                        await ws.send(json.dumps(message))
+                    heartbeat = asyncio.create_task(self._heartbeat(ws))
+                    try:
+                        async for raw in ws:
+                            await self._handle(raw)
+                    finally:
+                        heartbeat.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await heartbeat
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.market.feed_disconnected(self.name, str(exc))
+                LOGGER.warning("MEXC websocket reconnect in %.1fs: %s", backoff, exc)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2.0, 30.0)
+
+    async def _heartbeat(self, ws: Any) -> None:
+        while True:
+            await asyncio.sleep(15.0)
+            await ws.send('{"method":"ping"}')
+
+    @staticmethod
+    def _decode(raw: str | bytes) -> dict[str, Any]:
+        if isinstance(raw, bytes):
+            with suppress(OSError):
+                raw = gzip.decompress(raw)
+            raw = raw.decode("utf-8")
+        return json.loads(raw)
+
+    async def _handle(self, raw: str | bytes) -> None:
+        payload = self._decode(raw)
+        if not isinstance(payload, dict):
+            return
+        channel = str(payload.get("channel") or "")
+        # Subscription acknowledgements use data="success" rather than an
+        # object. They are control messages, not market events.
+        if channel == "pong" or not channel or channel.startswith("rs."):
+            return
+        raw_data = payload.get("data")
+        data_symbol = raw_data.get("symbol") if isinstance(raw_data, dict) else ""
+        symbol = str(payload.get("symbol") or data_symbol or "")
+        if not symbol:
+            return
+        symbol = symbol.upper().replace("/", "_")
+        if symbol not in self.market.symbols:
+            return
+        self.market.feed_message(self.name)
+        state = self.market.symbol(symbol)
+        ts = float(payload.get("ts") or time.time() * 1000) / 1000.0
+
+        if not state.contract_metadata_ready and channel in {"push.deal", "push.depth", "push.depth.full"}:
+            return
+
+        if channel == "push.deal":
+            rows = payload.get("data", [])
+            if isinstance(rows, dict):
+                rows = [rows]
+            for row in rows:
+                price = float(row.get("p") or 0.0)
+                contracts = float(row.get("v") or 0.0)
+                event_ts = float(row.get("cts") or row.get("t") or ts * 1000) / 1000.0
+                state.add_trade(
+                    TradeEvent(
+                        symbol=symbol,
+                        venue="mexc",
+                        price=price,
+                        base_qty=contracts * state.contract_size,
+                        side=Side.LONG if int(row.get("T") or 1) == 1 else Side.SHORT,
+                        ts=event_ts,
+                        open_close=int(row["O"]) if row.get("O") is not None else None,
+                    )
+                )
+        # MEXC returns full-depth subscriptions as push.depth.full (some
+        # deployments use the shorter push.depth name). Treat both forms as
+        # order-book snapshots so the execution/universe gates see a BBO.
+        elif channel == "push.depth.full":
+            data = payload.get("data") or {}
+            version = int(data["version"]) if data.get("version") is not None else None
+            state.book("mexc").apply_snapshot(
+                data.get("bids", []),
+                data.get("asks", []),
+                version=version,
+                qty_multiplier=state.contract_size,
+                ts=float(data.get("cts") or ts * 1000) / 1000.0,
+            )
+            state.record_book_mid("mexc", ts)
+        elif channel == "push.funding.rate":
+            data = payload.get("data") or {}
+            next_settle = float(data.get("nextSettleTime") or 0.0)
+            if next_settle > 10_000_000_000:
+                next_settle /= 1000.0
+            state.update_derivatives(
+                ts=ts,
+                funding_rate=float(data.get("fundingRate") or data.get("rate") or 0.0),
+                next_funding_at=next_settle or None,
+            )
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._http is not None:
+            await self._http.aclose()

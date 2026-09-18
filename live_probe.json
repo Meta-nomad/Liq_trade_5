@@ -1,0 +1,41 @@
+{
+  "duration_seconds": 35,
+  "engine_error": "",
+  "engine_ticked": true,
+  "universe_error": "",
+  "eligible_symbols": [
+    "BTC_USDT"
+  ],
+  "metadata_ready": true,
+  "api_allowed": true,
+  "contract_size": 0.0001,
+  "max_leverage": 500.0,
+  "hour_closes": 320,
+  "feeds": {
+    "mexc": {
+      "name": "mexc",
+      "connected": true,
+      "last_event_at": 1789712160.4517026,
+      "messages": 205,
+      "reconnects": 0,
+      "last_error": ""
+    },
+    "bybit": {
+      "name": "bybit",
+      "connected": true,
+      "last_event_at": 1789712160.608,
+      "messages": 1307,
+      "reconnects": 0,
+      "last_error": ""
+    },
+    "binance": {
+      "name": "binance",
+      "connected": true,
+      "last_event_at": 1789712160.493,
+      "messages": 7475,
+      "reconnects": 1,
+      "last_error": ""
+    }
+  },
+  "opens": 0
+}
