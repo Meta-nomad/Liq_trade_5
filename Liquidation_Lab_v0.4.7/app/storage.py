@@ -92,6 +92,14 @@ class Storage:
                 event TEXT NOT NULL,
                 detail TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS entry_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                account TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_decisions_ts ON entry_decisions(ts DESC);
             """
         )
         self.connection.commit()
@@ -143,10 +151,16 @@ class Storage:
             )
             self._conn().commit()
 
-    async def save_checkpoint(self, ts, trades, payloads) -> None:
+    async def save_checkpoint(self, ts, trades, payloads, decisions=()) -> None:
         """Commit closed trades and the corresponding balances/positions together."""
         async with self.lock:
             with self._conn():
+                for decision in decisions:
+                    self._conn().execute(
+                        'INSERT INTO entry_decisions(ts,account,reason,payload) VALUES(?,?,?,?)',
+                        (decision['ts'], decision['account'], decision['reason'],
+                         json.dumps(decision, ensure_ascii=False, allow_nan=False)),
+                    )
                 for trade in trades:
                     self._conn().execute(
                         """INSERT OR REPLACE INTO trades(
@@ -178,6 +192,14 @@ class Storage:
                 ),
             )
             self._conn().commit()
+
+    async def recent_decisions(self, limit: int = 100) -> list[dict[str, Any]]:
+        async with self.lock:
+            rows = self._conn().execute(
+                'SELECT payload FROM entry_decisions ORDER BY id DESC LIMIT ?',
+                (max(1, min(limit, 1000)),),
+            ).fetchall()
+        return [json.loads(row['payload']) for row in rows]
 
     async def save_account_states(self, ts: float, payloads: dict[str, dict[str, Any]]) -> None:
         rows = [

@@ -78,7 +78,7 @@ class PaperTradingService:
             len(self.settings.symbols),
             self.settings.paper_balance,
         )
-        LOGGER.info("RELEASE v0.4.7-20260918 accounts=%s execution=PAPER_ONLY venues=MEXC_EXECUTION,BYBIT_LIQUIDATION,BINANCE_CONFIRMATION liquidation_regime_aligned=true flow_proxy_executable=false",
+        LOGGER.info("RELEASE v0.4.8-20260918 accounts=%s execution=PAPER_ONLY venues=MEXC_EXECUTION,BYBIT_LIQUIDATION,BINANCE_CONFIRMATION liquidation_regime_aligned=true flow_proxy_executable=false",
                     ",".join(self.broker.accounts))
 
     async def _refresh_universe(self) -> None:
@@ -172,7 +172,7 @@ class PaperTradingService:
             position_count = sum(int(item["positions_count"]) for item in accounts.values())
             composite = accounts.get("COMPOSITE_FLOW", next(iter(accounts.values()), {}))
             for name, item in accounts.items():
-                LOGGER.info("PAPER ACCOUNT account=%s equity=%.2f positions=%s leverage=%s", name, item["equity"], item["positions_count"], item["max_leverage"])
+                LOGGER.info("PAPER ACCOUNT account=%s equity=%.2f positions=%s leverage=%s halted_reason=%s stop_losses_today=%s entry_state=%s", name, item["equity"], item["positions_count"], item["max_leverage"], item['halted_reason'] or 'none', item['stop_losses_today'], item['entry_state'])
             equity = float(composite.get("equity", 0.0))
             realised = float(composite.get("realized_pnl", 0.0))
             floating = equity - float(composite.get("balance", equity))
@@ -242,12 +242,15 @@ class PaperTradingService:
                     symbol: features[symbol] for symbol in active if symbol in features
                 }
                 signals = self.router.evaluate_all(signal_states, signal_features, tick_started)
+                tick_decisions = []
                 for signal in signals:
                     if not self._deduplicated(signal, tick_started):
                         continue
                     self.signal_count += 1
                     await self.storage.save_signal(signal)
                     opened = self.broker.handle_signal(signal, tick_started)
+                    tick_decisions.extend(copy.deepcopy(d) for d in self.broker.entry_decisions.values()
+                                          if d['symbol'] == signal.symbol and d['ts'] == tick_started)
                     for position in opened:
                         self.open_count += 1
                         LOGGER.info(
@@ -268,8 +271,11 @@ class PaperTradingService:
                         # will replace this timestamp as soon as it arrives.
                         state.next_funding_at = 0.0  # Wait for the next venue-announced settlement.
 
-                await self.storage.save_checkpoint(tick_started, closed, self.broker.snapshots())
+                await self.storage.save_checkpoint(tick_started, closed, self.broker.snapshots(), tick_decisions)
                 committed = True
+                for d in tick_decisions:
+                    LOGGER.info('ENTRY DECISION account=%s symbol=%s setup=%s side=%s leverage=%s reason=%s',
+                                d['account'], d['symbol'], d['setup'], d['side'], d['leverage'], d['reason'])
 
                 if tick_started - self._last_feature_persist >= self.settings.feature_persist_seconds:
                     for feature in features.values():

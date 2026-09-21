@@ -537,6 +537,9 @@ class PaperBroker:
             "total_fees": account.total_fees,
             "total_funding": account.total_funding,
             "halted_reason": account.halted_reason,
+            "entry_state": ('halted' if account.halted_reason else
+                            'position_limit' if len(account.positions) >= (1 if self.settings.high_leverage_lab else self.settings.max_open_positions)
+                            else 'awaiting_valid_signal'),
             "positions": [
                 position.as_dict(self.mark_price(position.symbol))
                 for position in account.positions.values()
