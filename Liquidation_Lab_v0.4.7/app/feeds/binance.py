@@ -9,7 +9,7 @@ from typing import Any
 import websockets
 
 from ..config import Settings
-from ..market import MarketState
+from ..market import MarketState, FeedStatus
 from ..models import Side, TradeEvent
 
 
@@ -25,6 +25,32 @@ class BinanceFeed:
         self.market = market
         self.settings = settings
         self._stop = asyncio.Event()
+        for kind in ('trades', 'book'):
+            self.market.feeds.setdefault(f'binance_{kind}', FeedStatus(name=f'binance_{kind}'))
+
+    def _channel_state(self, kind: str, connected: bool, error: str = '') -> None:
+        name = f'binance_{kind}'
+        if connected:
+            self.market.feed_connected(name)
+        else:
+            self.market.feed_disconnected(name, error)
+            for state in self.market.symbols.values():
+                if kind == 'book':
+                    book = state.book('binance')
+                    book.updated_at = 0
+                    book.bids.clear()
+                    book.asks.clear()
+                else:
+                    state.trades['binance'].clear()
+        channels = [self.market.feeds[f'binance_{k}'] for k in ('trades', 'book')]
+        aggregate = self.market.feeds[self.name]
+        aggregate.connected = all(s.connected for s in channels)
+        aggregate.last_error = '; '.join(f'{s.name}: {s.last_error}' for s in channels if s.last_error)
+        aggregate.reconnects = sum(s.reconnects for s in channels)
+
+    @staticmethod
+    def _next_backoff(previous: float, duration: float) -> float:
+        return 1.0 if duration >= 60 else min(previous * 2, 30.0)
 
     async def run(self) -> None:
         await asyncio.gather(
@@ -35,6 +61,7 @@ class BinanceFeed:
     async def _run_channel(self, kind: str, url: str) -> None:
         backoff = 1.0
         while not self._stop.is_set():
+            connected_at = time.monotonic()
             try:
                 async with websockets.connect(
                     url,
@@ -43,23 +70,38 @@ class BinanceFeed:
                     close_timeout=5,
                     max_size=8 * 1024 * 1024,
                 ) as ws:
-                    self.market.feed_connected(self.name)
-                    backoff = 1.0
+                    # A TCP handshake alone does not confirm the subscription.
+                    connected_at = time.monotonic()
                     suffix = "aggTrade" if kind == "trades" else "bookTicker"
                     params = [f"{symbol.replace('_', '').lower()}@{suffix}" for symbol in self.settings.symbols]
                     await ws.send(json.dumps({"method": "SUBSCRIBE", "params": params, "id": kind}))
-                    async for raw in ws:
+                    acknowledged = False
+                    while not self._stop.is_set():
+                        raw = await asyncio.wait_for(ws.recv(), timeout=30 if acknowledged else 10)
                         payload = json.loads(raw)
+                        if payload.get('code') is not None or payload.get('error'):
+                            raise RuntimeError(f'Binance subscription rejected: {payload}')
+                        if payload.get('id') == kind:
+                            if payload.get('result', 'missing') is not None:
+                                raise RuntimeError(f'Unexpected subscription response: {payload}')
+                            acknowledged = True
+                            self._channel_state(kind, True)
+                            continue
                         data = payload.get("data", payload)
                         if isinstance(data, dict):
                             await self._handle(kind, data)
             except asyncio.CancelledError:
+                self._channel_state(kind, False, 'stopped')
                 raise
             except Exception as exc:
-                self.market.feed_disconnected(self.name, str(exc))
-                LOGGER.warning("Binance %s websocket reconnect in %.1fs: %s", kind, backoff, exc)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2.0, 30.0)
+                detail = str(exc) or type(exc).__name__
+                self._channel_state(kind, False, detail)
+                LOGGER.warning("Binance %s websocket reconnect in %.1fs: %s", kind, backoff, detail)
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    pass
+                backoff = self._next_backoff(backoff, time.monotonic() - connected_at - backoff)
 
     @staticmethod
     def _mexc_symbol(symbol: str) -> str:
@@ -75,6 +117,7 @@ class BinanceFeed:
             return
         ts = float(data.get("T") or data.get("E") or time.time() * 1000) / 1000.0
         self.market.feed_message(self.name, ts)
+        self.market.feed_message(f'binance_{kind}', ts)
         state = self.market.symbol(symbol)
         if kind == "trades" and data.get("e") == "aggTrade":
             state.add_trade(
@@ -99,4 +142,3 @@ class BinanceFeed:
 
     async def stop(self) -> None:
         self._stop.set()
-

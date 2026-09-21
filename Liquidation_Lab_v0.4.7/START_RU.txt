@@ -1,11 +1,4 @@
-LIQUIDATION LAB 0.4.7 — PAPER ONLY
-
-Начните с README_RU.md и AUDIT_RU.md.
-Быстрый запуск: python -m pip install -r requirements.txt && python -m app
-Панель: http://localhost:8000
-Проверка: python -m pytest tests scenario_model
-
-Live означает только публичные рыночные данные. Реальных заявок нет.
-В Railway требуется доступная постоянная база /data. При её отказе запуск
-останавливается: новый временный счёт больше не создаётся.
-Не ослабляйте фильтры ради появления сделок: причина блокировки — часть результата.
+Liquidation Lab 0.4.8 — PAPER ONLY
+Начните с README_RU.md.
+python -m pip install -r requirements.txt
+python -m app

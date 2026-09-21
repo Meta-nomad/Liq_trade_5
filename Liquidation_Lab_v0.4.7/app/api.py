@@ -36,7 +36,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Order Flow Paper Lab",
-    version="0.4.7",
+    version="0.4.8",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url=None,
@@ -83,6 +83,11 @@ async def api_signals(limit: int = Query(default=100, ge=1, le=1_000)) -> list[d
 @app.get("/api/diagnostics", dependencies=[Depends(authorise)])
 async def api_diagnostics() -> dict[str, object]:
     return await service.diagnostics()
+
+
+@app.get('/api/decisions', dependencies=[Depends(authorise)])
+async def api_decisions(limit: int = Query(default=100, ge=1, le=1000)) -> list[dict[str, object]]:
+    return await service.storage.recent_decisions(limit)
 
 
 @app.get("/api/equity/{account}", dependencies=[Depends(authorise)])

@@ -32,6 +32,7 @@ class FeedStatus:
     messages: int = 0
     reconnects: int = 0
     last_error: str = ""
+    connections: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -447,7 +448,7 @@ class SymbolState:
         consensus_values: list[float] = []
         for venue in ("mexc", "bybit", "binance"):
             history = self.price_history.get(venue)
-            if history and len(history) >= 2:
+            if history and len(history) >= 2 and 0 <= now - history[-1][0] <= stale_after:
                 consensus_values.append(math.tanh(self.venue_return(venue, 30.0, now) * 500.0))
         cross_consensus = sum(consensus_values) / len(consensus_values) if consensus_values else 0.0
 
@@ -552,8 +553,9 @@ class MarketState:
 
     def feed_connected(self, name: str) -> None:
         status = self.feeds.setdefault(name, FeedStatus(name=name))
-        if status.connected:
+        if status.connections:
             status.reconnects += 1
+        status.connections += 1
         status.connected = True
         status.last_error = ""
 
