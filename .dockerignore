@@ -1,7 +1,9 @@
 .git
+.env
 **/__pycache__
-**/*.pyc
-**/.env
-**/*.db*
-*.zip
-*.patch
+**/.pytest_cache
+**/*.db
+**/*.db-*
+**/*.zip
+Liquidation_Lab_v0.4.7
+tests

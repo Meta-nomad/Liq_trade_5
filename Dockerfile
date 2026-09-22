@@ -3,19 +3,19 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8000 \
-    DB_PATH=/data/paper_v040.db
+    FLOW_DB_PATH=/data/flow_v050.db
 
 WORKDIR /app
 
-COPY Liquidation_Lab_v0.4.7/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && addgroup --system paper \
     && adduser --system --ingroup paper --home /app paper \
     && mkdir -p /data \
     && chown -R paper:paper /app /data
 
-COPY --chown=paper:paper Liquidation_Lab_v0.4.7/app ./app
-COPY --chown=paper:paper Liquidation_Lab_v0.4.7/pyproject.toml Liquidation_Lab_v0.4.7/README_RU.md ./
+COPY --chown=paper:paper app ./app
+COPY --chown=paper:paper pyproject.toml README.md ./
 
 # Railway mounts a persistent volume at runtime.  Its ownership is supplied
 # by the platform and can be root:root, so dropping privileges here makes

@@ -11,8 +11,5 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -r requirements-dev.txt
-        working-directory: Liquidation_Lab_v0.4.7
-      - run: python -m pytest tests scenario_model -q -p no:cacheprovider
-        working-directory: Liquidation_Lab_v0.4.7
-      - run: docker build -t liquidation-lab:check .
-      - run: docker build -t liquidation-lab:nested Liquidation_Lab_v0.4.7
+      - run: python -m pytest tests -q -p no:cacheprovider
+      - run: docker build -t composite-flow:check .

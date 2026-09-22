@@ -1,25 +1,75 @@
-# Liquidation Lab 0.4.8
+# Composite Flow 0.5.1 — объединённая бумажная версия
 
-Paper-only laboratory; no real exchange orders are sent.
+Единственный актуальный код — `app/` в корне репозитория. Railway собирает
+корневой Dockerfile. Папка Liquidation_Lab_v0.4.7 и прежние отчёты, если они
+есть в репозитории, являются историческими материалами, не рабочим приложением.
 
-Application source remains in `Liquidation_Lab_v0.4.7/` for compatibility with existing Railway root-directory settings. The package version is 0.4.8.
+## Что объединено
+
+- Стратегия 0.5.0: 30 кандидатов, reversal по наблюдаемым ликвидациям только
+  в RANGE/STRESS, цель 1.8R после комиссий. Trend breakout остаётся отдельным
+  сценарием со своей целью. Proxy без ликвидаций выключен.
+- По умолчанию 5x, до трёх позиций и 1.2% суммарного риска; риск на вход
+  0.35/0.50/0.60% в зависимости от сигнала. Это параметры эксперимента,
+  а не статистически доказанный оптимум или обещание прибыли/частоты входов.
+- Исправления 0.4.8: атомарная запись сделок, состояний и решений; откат памяти
+  при отказе записи; единицы контрактов и метаданные; разделение funding;
+  выходы по свежему MEXC; раздельные каналы и переподключения Binance;
+  объяснения отказов и корректный HTTP 503 при ошибке движка.
+- Экспорт всей истории текущей базы: `/api/trades/export` (кнопка на панели).
+  `/api/decisions` — история причин открытия/отказа. Требуется DASHBOARD_TOKEN.
+
+## Ограничение технической истории
+
+Признаки записываются не чаще раза в 60 секунд на монету (вместо 10 секунд).
+При 30 монетах это до 43 200 записей в сутки вместо 993 600 при прежних 115.
+
+| Таблица | Срок | Порог записей |
+| --- | --- | --- |
+| Признаки | 1 сутки | 50 000 |
+| Сигналы и решения | 7 суток | по 20 000 |
+| График капитала | 30 суток | 50 000 |
+| Служебные события | 7 суток | 10 000 |
+
+Проверка раз в минуту; удаление пакетами до 5000 просроченных и 5000 лишних
+строк на таблицу за проход. Пороги могут временно превышаться между проходами,
+а старая большая база очищается постепенно. Это не жёсткий лимит мегабайт.
+Закрытые сделки и текущие состояния НЕ удаляются и продолжают расти по мере
+торговли; для долгосрочного хранения всё равно нужны резервные копии.
+
+При свободном месте ниже 64 MiB необязательная запись отключается; критическая
+запись сделок/состояний сохраняется. Ниже 8 MiB очистка не запускается, поскольку
+DELETE тоже требует места. Нет автоматического полного VACUUM. Новые базы
+используют incremental vacuum, старые могут переиспользовать освобождённые
+страницы, не уменьшая файл. Уже заполненный Volume требует отдельного
+восстановления места после резервной копии. Этот релиз его не удаляет.
 
 ## Railway
 
-Build from the repository root using the root `Dockerfile` and `railway.toml`. Existing services using `Liquidation_Lab_v0.4.7` as their root can continue to use the Dockerfile in that directory.
+- Source: этот репозиторий, ветка main; Root Directory — корень.
+- Builder: Dockerfile (railway.toml); Start: `python -m app`.
+- Постоянный Volume должен быть смонтирован в `/data` и иметь свободное место.
+- Установите DASHBOARD_TOKEN. Параметры показаны в `.env.example`.
+- База нового эксперимента: `FLOW_DB_PATH=/data/flow_v050.db`. Имя сохранено
+  для совместимости с локальной 0.5.0. Прежний DB_PATH не используется.
+  Старая paper_v040.db не удаляется и не переносится автоматически: история
+  старых счетов не смешивается с новым экспериментом. Не указывайте старую
+  базу для очистки без резервной копии и отдельной проверки миграции.
+- HIGH_LEVERAGE_LAB из старых Variables не включает прежние счета 20–200x.
+  FLOW_SYMBOLS задаёт новый список; старый SYMBOLS игнорируется.
 
-Mount persistent storage at `/data`; the default SQLite path is `/data/paper_v040.db`. Preserve the existing database and make a backup before updating. Configure `DASHBOARD_TOKEN` before exposing the dashboard. `DATA_MODE=live` uses public exchange data, but execution remains paper-only.
+Первые минуты — прогрев. Для торговли нужны минимум 10 готовых инструментов,
+проверенные метаданные, свежие данные и подходящий сигнал. Ноль сделок сам
+по себе не означает поломку. Панель показывает причины блокировки счетов.
 
-`/health` reports engine health, not the availability of a trading opportunity. `/api/status` includes account halt reasons and feed status; `/api/decisions` includes persisted entry decisions. Both API routes use the configured dashboard token.
+## Проверки и ограничения
 
-## Local checks
+`python -m pip install -r requirements-dev.txt`
 
-```sh
-cd Liquidation_Lab_v0.4.7
-python -m pip install -r requirements.txt -r requirements-dev.txt
-python -m pytest tests scenario_model -q -p no:cacheprovider
-```
+`python -m pytest tests -q`
 
-For an offline run set `DATA_MODE=synthetic` and a writable `DB_PATH`, then run `python -m app`.
-
-See [release notes](Liquidation_Lab_v0.4.7/CHANGELOG_048_RU.md) and [configuration](Liquidation_Lab_v0.4.7/README_RU.md).
+Локально проверены 47 тестов плюс подслучаи LONG/SHORT. GitHub Actions
+дополнительно собирает Docker на Python 3.12. Локальная среда Python 3.14.
+Проверки не являются полугодовым историческим тестом; прибыльность и
+интенсивность торговли не доказаны. Исполнение исключительно PAPER_ONLY,
+а модель комиссий, ликвидации и исполнения приблизительная. Реальных заявок нет.
